@@ -18,7 +18,7 @@
     { id: "english", label: "Version anglaise", hint: "Traduction complète" },
     { id: "review", label: "Vérification", hint: "Score SEO, aperçu final" },
     { id: "export", label: "Télécharger", hint: "Fichier .md, images, llms" },
-    { id: "publish", label: "Publier", hint: "Guide pas à pas ou commit auto" },
+    { id: "publish", label: "Publier", hint: "Commit auto ou guide manuel" },
   ];
 
   const state = {
@@ -27,7 +27,7 @@
     enTab: "article",
     editorMode: "split",
     previewLocale: "fr",
-    publishTab: "guide",
+    publishTab: "auto",
     remoteSlugs: {},
     live: [],
     savedAt: null,
@@ -463,7 +463,7 @@
         </div>
         <div class="gh-import">
           <button class="btn btn-ghost" data-action="gh-list-posts">Importer depuis GitHub…</button>
-          <span class="muted small">Nécessite un jeton configuré à l'étape « Publier ».</span>
+          <span class="muted small">Nécessite un jeton dans le panneau « Connexion GitHub » (à droite sur ordinateur, en bas de page sur mobile).</span>
           <div id="gh-post-list"></div>
         </div>
       </section>
@@ -917,6 +917,26 @@
     } catch {}
   }
 
+  function renderGhPanel() {
+    const cfg = ghSettings();
+    const g = state.gh;
+    return `<h3>Connexion GitHub</h3>
+      <p class="muted small">Pour importer un article depuis GitHub et publier automatiquement. Le jeton est propre à chaque site.</p>
+      <label class="field"><span class="field-label">Dépôt</span><input type="text" data-gh="repo" value="${esc(cfg.repo)}" /></label>
+      <label class="field"><span class="field-label">Branche</span><input type="text" data-gh="branch" value="${esc(cfg.branch)}" /></label>
+      <label class="field"><span class="field-label">Jeton</span>
+        <div class="input-group"><input type="password" id="gh-token" data-gh="token" value="${esc(cfg.token)}" placeholder="github_pat_…" autocomplete="off" spellcheck="false" /><button type="button" class="icon-btn reveal" data-action="toggle-token" title="Afficher / masquer">👁</button></div>
+      </label>
+      <label class="inline-check small"><input type="checkbox" data-gh="remember" ${cfg.remember ? "checked" : ""}/> Se souvenir sur cet appareil</label>
+      <small class="hint">${cfg.remember ? "Gardé dans ce navigateur jusqu'à ce que vous décochiez." : "Oublié à la fermeture de l'onglet."}</small>
+      <div class="row-actions mt">
+        <button class="btn btn-ghost" data-action="gh-check" ${cfg.token ? "" : "disabled"}>Tester</button>
+        ${cfg.token ? '<button class="btn btn-ghost danger" data-action="gh-forget">Effacer</button>' : ""}
+      </div>
+      <div id="gh-check-result">${g.checked ? `<p class="check check-ok"><span class="dot"></span>${esc(g.checked)}</p>` : ""}</div>
+      <button class="link-btn mt" data-action="token-help">Comment créer un jeton ?</button>`;
+  }
+
   function plannedFiles() {
     const d = state.draft;
     const s = site();
@@ -948,18 +968,12 @@
           <p class="muted small">Sécurité : n'utilisez jamais un jeton « classic » avec tous les droits. Par défaut le jeton est oublié à la fermeture de l'onglet. Ne cochez « Se souvenir » que sur votre ordinateur personnel. En cas de doute, révoquez-le sur la même page GitHub.</p>
         </details>
       </section>
-      <section class="card">
-        <h3>Connexion</h3>
-        <div class="grid-3">
-          <label class="field"><span class="field-label">Dépôt (propriétaire/nom)</span><input type="text" data-gh="repo" value="${esc(cfg.repo)}" /></label>
-          <label class="field"><span class="field-label">Branche de publication</span><input type="text" data-gh="branch" value="${esc(cfg.branch)}" /></label>
-          <label class="field"><span class="field-label">Jeton GitHub</span><input type="password" data-gh="token" value="${esc(cfg.token)}" placeholder="github_pat_…" autocomplete="off" /></label>
+      <section class="card row-between">
+        <div>
+          <h3>Connexion</h3>
+          <p class="muted small">${cfg.token ? `Jeton enregistré pour <code>${esc(cfg.repo)}</code> (${esc(cfg.branch)}).` : "Aucun jeton : renseignez-le dans le panneau « Connexion GitHub » (à droite sur ordinateur, en bas de page sur mobile)."}</p>
         </div>
-        <div class="row-between">
-          <label class="inline-check"><input type="checkbox" data-gh="remember" ${cfg.remember ? "checked" : ""}/> Se souvenir du jeton sur cet appareil</label>
-          <button class="btn btn-ghost" data-action="gh-check">Tester la connexion</button>
-        </div>
-        <div id="gh-check-result">${g.checked ? `<p class="check check-ok"><span class="dot"></span>${esc(g.checked)}</p>` : ""}</div>
+        <button class="btn btn-ghost" data-action="focus-token">${cfg.token ? "Modifier" : "Ajouter un jeton"}</button>
       </section>
       <section class="card">
         <h3>Publication</h3>
@@ -979,10 +993,10 @@
   }
 
   function renderPublish() {
-    return `${stepHeader("Publier", "Deux façons de mettre l'article en ligne : à la main en suivant le guide, ou automatiquement depuis cette page avec un jeton GitHub.")}
+    return `${stepHeader("Publier", "Deux façons de mettre l'article en ligne : automatiquement depuis cette page avec un jeton GitHub, ou à la main en suivant le guide.")}
       <div class="tabs">
-        <button class="${state.publishTab === "guide" ? "on" : ""}" data-action="publish-tab" data-tab="guide">Guide pas à pas</button>
         <button class="${state.publishTab === "auto" ? "on" : ""}" data-action="publish-tab" data-tab="auto">Publication automatique</button>
+        <button class="${state.publishTab === "guide" ? "on" : ""}" data-action="publish-tab" data-tab="guide">Guide pas à pas (manuel)</button>
       </div>
       ${state.publishTab === "guide" ? renderGuide() : renderAuto()}
       ${navButtons()}`;
@@ -1109,7 +1123,14 @@
     renderSidebar();
     const stepInfo = STEPS.find((s) => s.id === state.step);
     $("#aside-title").textContent = `Contrôles · ${stepInfo.label}`;
+    $("#aside-gh").innerHTML = renderGhPanel();
     refreshLive();
+    // On mobile the steps are a horizontal strip: keep the current one visible.
+    const strip = $("#steps");
+    const current = $(".steps .active");
+    if (strip && current && strip.scrollWidth > strip.clientWidth) {
+      strip.scrollLeft = current.offsetLeft - (strip.clientWidth - current.offsetWidth) / 2;
+    }
     if (keepScroll) window.scrollTo(0, scroll);
     else window.scrollTo(0, 0);
     try {
@@ -1570,7 +1591,7 @@ A 2 or 3 sentence summary, leading to how you can help.
 
   function ghClient() {
     const cfg = ghSettings();
-    if (!cfg.token) throw new Error("Collez d'abord un jeton GitHub (étape « Publier » → « Publication automatique »).");
+    if (!cfg.token) throw new Error("Collez d'abord un jeton dans le panneau « Connexion GitHub ».");
     return GH.create({ token: cfg.token.trim(), repo: cfg.repo.trim(), branch: cfg.branch.trim() });
   }
 
@@ -1766,6 +1787,9 @@ A 2 or 3 sentence summary, leading to how you can help.
         const cfg = ghSettings();
         cfg[t.dataset.gh] = t.value;
         saveGhSettings(cfg);
+        state.gh.checked = null;
+        const testBtn = $("[data-action=gh-check]");
+        if (testBtn) testBtn.disabled = !cfg.token;
       }
     });
 
@@ -2005,6 +2029,31 @@ A 2 or 3 sentence summary, leading to how you can help.
           render({ keepScroll: true });
         },
         "gh-check": () => ghCheck(),
+        "toggle-token": () => {
+          const input = $("#gh-token");
+          input.type = input.type === "password" ? "text" : "password";
+        },
+        "gh-forget": () => {
+          const cfg = ghSettings();
+          cfg.token = "";
+          cfg.remember = false;
+          saveGhSettings(cfg);
+          state.gh.checked = null;
+          toast("Jeton effacé de ce navigateur.", "ok");
+          render({ keepScroll: true });
+        },
+        "focus-token": () => {
+          const input = $("#gh-token");
+          input.scrollIntoView({ block: "center", behavior: "smooth" });
+          setTimeout(() => input.focus(), 300);
+        },
+        "token-help": () => {
+          state.step = "publish";
+          state.publishTab = "auto";
+          render();
+          const det = $(".main details");
+          if (det) det.open = true;
+        },
         "gh-list-posts": () => ghListPosts(),
         "gh-import": () => ghImport(el.dataset.slug),
         "gh-publish": () => ghPublish(),
