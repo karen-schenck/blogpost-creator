@@ -33,6 +33,10 @@
     savedAt: null,
     dirty: false,
     gh: { log: [], result: null, running: false, checked: null },
+    screen: "home",
+    brief: null,
+    aiReport: null,
+    aiPending: null,
   };
 
   /* ---------------- utilities ---------------- */
@@ -228,10 +232,25 @@
   }
 
   function loadDraftObject(obj) {
-    if (!obj || obj.version !== 1 || !obj.fr || !SITES[obj.site]) throw new Error("Ce fichier n'est pas un brouillon valide.");
-    state.draft = obj;
+    // Drafts kept in this browser were produced by the tool itself: still validated, leniently.
+    const report = validateDraftJson(obj, { lenient: true });
+    if (report.errors.length) throw new Error(report.errors.slice(0, 3).join(" "));
+    report.draft.savedAt = obj.savedAt;
+    state.draft = report.draft;
     applyTheme();
     autosave();
+  }
+
+  function showReportModal(report, title) {
+    openModal({
+      title,
+      wide: true,
+      submitLabel: report.errors.length ? "Fermer" : "Importer et vérifier →",
+      body: renderReport(report).replace(/<div class="row-actions mt">[\s\S]*?<\/div>/, ""),
+      onSubmit() {
+        if (!report.errors.length) applyImportedDraft(report, "Brouillon");
+      },
+    });
   }
 
   /* ---------------- checks ---------------- */
@@ -406,21 +425,10 @@
   function renderStart() {
     const d = state.draft;
     const drafts = Object.values(storeGet(STORE_DRAFTS, {})).sort((a, b) => (b.savedAt || "").localeCompare(a.savedAt || ""));
-    const siteCards = Object.values(SITES)
-      .map(
-        (s) => `<button class="site-card ${d.site === s.id ? "active" : ""}" data-action="pick-site" data-site="${s.id}" style="--c-ink:${s.theme.ink};--c-accent:${s.theme.accent}">
-          <span class="site-card-mark"></span>
-          <strong>${esc(s.name)}</strong>
-          <span>${esc(s.tagline)}</span>
-          <small>${esc(s.domain.replace("https://", ""))} · ${s.posts.length} articles</small>
-        </button>`
-      )
-      .join("");
-    return `${stepHeader("Démarrer", "Choisissez le site, puis créez un nouvel article ou reprenez un brouillon. Tout est enregistré automatiquement dans ce navigateur.")}
-      <section class="card">
-        <h3>1. Pour quel site ?</h3>
-        <div class="site-cards">${siteCards}</div>
-        <p class="muted small">Le site choisi définit les catégories, les pages pour les liens internes, l'appel à l'action par défaut, le dépôt GitHub et le format de llms.txt.</p>
+    return `${stepHeader("Démarrer", "Reprenez un brouillon, importez un article existant ou commencez un nouvel article. Tout est enregistré automatiquement dans ce navigateur.")}
+      <section class="card row-between">
+        <div><h3>1. Site</h3><p class="muted">${esc(site().name)} · ${esc(site().domain.replace("https://", ""))}</p></div>
+        <div class="row-actions"><button class="btn btn-ghost" data-action="screen" data-screen="home">Changer de site</button><button class="btn btn-ghost" data-action="mode" data-mode="ai">✨ Rédiger avec l'IA</button></div>
       </section>
 
       <section class="card">
@@ -453,7 +461,7 @@
           <label class="drop">
             <input type="file" accept=".json,application/json" data-action="load-draft-file" hidden />
             <strong>Charger un brouillon (.json)</strong>
-            <span>Le fichier téléchargé avec « Télécharger le brouillon ». Pratique pour changer d'ordinateur ou partager.</span>
+            <span>Un brouillon téléchargé avec « Télécharger le brouillon », ou le JSON produit par une IA. Sa structure est vérifiée avant l'import.</span>
           </label>
           <label class="drop">
             <input type="file" accept=".md,text/markdown" data-action="import-md-file" hidden />
@@ -617,7 +625,7 @@
         imgs.length
           ? `<ul class="img-list">${imgs
               .map(
-                (img, i) => `<li><img src="${img.dataUrl}" alt="" /><div><code>${esc(img.src)}</code><small>${Math.round(img.bytes / 1024)} Ko · ${img.width}×${img.height}</small></div><button class="link-btn danger" data-action="image-remove" data-index="${i}">Retirer</button></li>`
+                (img, i) => `<li><img src="${img.dataUrl}" alt="" /><div><code>${esc(img.src)}</code><small>${Math.round(img.bytes / 1024)} Ko · ${img.width}×${img.height}</small></div><span class="row-actions"><button class="link-btn" data-action="image-insert" data-index="${i}">Insérer</button><button class="link-btn danger" data-action="image-remove" data-index="${i}">Retirer</button></span></li>`
               )
               .join("")}</ul>`
           : '<p class="muted small">Aucune. Le bouton « Image » convertit en WebP, redimensionne (1600 px max) et nomme le fichier pour vous.</p>'
@@ -1085,6 +1093,681 @@
     });
   }
 
+  /* ---------------- AI flow: brief, prompt, validation, import ---------------- */
+
+  const STORE_SCREEN = "bpc.screen";
+  const briefKey = () => `bpc.brief.${site().id}`;
+
+  function emptyBrief() {
+    return {
+      title: "",
+      subject: "",
+      audience: "",
+      goal: "",
+      keywords: "",
+      length: "1400",
+      tone: "",
+      languages: { fr: true, en: true },
+      research: true,
+      sources: "",
+      facts: "",
+      avoid: "",
+      images: [],
+      tables: [],
+      response: "",
+    };
+  }
+
+  function loadBrief() {
+    const saved = storeGet(briefKey());
+    state.brief = { ...emptyBrief(), ...(saved || {}) };
+    state.brief.languages = { fr: true, en: true, ...(state.brief.languages || {}) };
+    state.aiReport = null;
+  }
+
+  let briefTimer = null;
+  function saveBrief() {
+    clearTimeout(briefTimer);
+    briefTimer = setTimeout(() => {
+      if (!storeSet(briefKey(), state.brief)) toast("Stockage du navigateur plein : retirez des images ou réduisez leur nombre.", "error");
+    }, 400);
+  }
+
+  // Tab/CSV/Markdown pasted from a spreadsheet -> Markdown pipe table.
+  function toMarkdownTable(text) {
+    const raw = String(text || "").trim();
+    if (!raw) return "";
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.every((l) => l.trim().startsWith("|"))) {
+      const rows = lines.filter((l) => !/^\|(?:\s*:?-+:?\s*\|)+$/.test(l.trim())).map((l) => l.trim().slice(1, -1).split("|").map((c) => c.trim()));
+      return rowsToMarkdown(rows);
+    }
+    const sep = lines[0].includes("\t") ? "\t" : lines[0].includes(";") ? ";" : ",";
+    return rowsToMarkdown(lines.map((l) => l.split(sep).map((c) => c.trim().replace(/^"|"$/g, ""))));
+  }
+
+  function rowsToMarkdown(rows) {
+    if (!rows.length) return "";
+    const cols = Math.max(...rows.map((r) => r.length));
+    const clean = (v) => String(v || "").replace(/\|/g, "/").replace(/\s+/g, " ").trim();
+    const out = [];
+    rows.forEach((r, i) => {
+      const cells = Array.from({ length: cols }, (_, c) => clean(r[c]) || (i === 0 ? `Colonne ${c + 1}` : ""));
+      out.push(`| ${cells.join(" | ")} |`);
+      if (i === 0) out.push(`| ${cells.map(() => "---").join(" | ")} |`);
+    });
+    return out.join("\n");
+  }
+
+  function buildPrompt() {
+    const s = site();
+    const b = state.brief;
+    const langs = ["fr", "en"].filter((l) => b.languages[l]);
+    const withEn = langs.includes("en");
+    const posts = [...s.posts, ...(state.remoteSlugs[s.id] || []).filter((x) => !s.posts.some((p) => p.slug === x)).map((x) => ({ slug: x, title: x }))];
+    const day = today();
+    const words = +b.length || 1400;
+    const keywords = b.keywords.split(/[,\n]/).map((k) => k.trim()).filter(Boolean);
+
+    const localeTemplate = (lang) => `{
+      "category": "${lang === "fr" ? "Catégorie en français" : "Category in English"}",
+      "title": "...",
+      "seoTitle": "...",
+      "description": "...",
+      "excerpt": "...",
+      "readingTime": "${Math.max(1, Math.round(words / 200))} min",
+      "keywords": ["mot-clé principal", "..."],
+      "heroEyebrow": "Catégorie · Sujet",
+      "intro": "...",
+      "keyTakeaways": ["...", "...", "..."],
+      "faq": [
+        { "question": "...", "answer": "..." }
+      ],
+      "cta": {
+        "title": "...",
+        "description": "...",
+        "primaryLabel": "...",
+        "primaryHref": "${s.cta[lang].primaryHref}",
+        "secondaryLabel": "...",
+        "secondaryHref": "${s.cta[lang].secondaryHref}"
+      },
+      "body": "Texte de l'article en Markdown, sauts de ligne encodés \\\\n"
+    }`;
+
+    const images = b.images.length
+      ? `## Images fournies (obligatoires)
+
+Insère chaque image UNE fois dans le corps de ${withEn ? "chaque langue" : "l'article"}, seule sur sa ligne, avec une ligne vide avant et après, exactement sous cette forme :
+![texte alternatif](IMAGE:identifiant "légende")
+- Le texte alternatif décrit l'image en une phrase, dans la langue de l'article (pas « image de… »).
+- La légende est facultative : si aucune n'est indiquée, écris ![texte alternatif](IMAGE:identifiant) sans guillemets.
+- N'invente pas d'autres images et ne change pas les identifiants.
+
+${b.images
+  .map((img) => `- ${img.id} : ${img.description || "(pas de description)"} | Emplacement : ${img.placement || "à toi de choisir l'endroit le plus pertinent"}${img.caption ? ` | Légende : ${img.caption}` : ""}`)
+  .join("\n")}
+`
+      : "";
+
+    const tables = b.tables.filter((t) => t.markdown.trim()).length
+      ? `## Tableaux fournis (obligatoires)
+
+Insère chaque tableau tel quel (mêmes données, mêmes colonnes), au format Markdown ci-dessous, avec une ligne vide avant et après. Tu peux ajouter une phrase d'introduction avant le tableau.${withEn ? " Pour la version anglaise, traduis les en-têtes et les textes, pas les chiffres." : ""}
+
+${b.tables
+  .filter((t) => t.markdown.trim())
+  .map((t) => `### ${t.id}${t.title ? ` : ${t.title}` : ""}\nEmplacement : ${t.placement || "à toi de choisir l'endroit le plus pertinent"}\n\n${t.markdown}`)
+  .join("\n\n")}
+`
+      : "";
+
+    const research = b.research
+      ? `Fais une recherche sérieuse avant d'écrire (utilise la recherche web si tu y as accès). Appuie-toi sur des sources fiables et vérifiables : études, organismes officiels, presse reconnue. N'invente AUCUN chiffre, AUCUNE étude, AUCUNE citation et AUCUNE source. Si tu ne peux pas vérifier une donnée, ne l'utilise pas. Termine le corps par une section « ## Sources » listant les sources réellement utilisées sous forme de liens Markdown.`
+      : `N'invente aucun chiffre, aucune étude ni aucune source. N'utilise que des informations sûres ou celles fournies ci-dessous.`;
+
+    return `Tu es un rédacteur web expert en SEO. Tu écris un article de blog pour le site ${s.domain} (${s.brand} : ${s.tagline}).
+Ta réponse sera importée automatiquement dans un outil : elle doit respecter EXACTEMENT le format demandé à la fin.
+
+## Le brief
+
+- Sujet / angle : ${b.subject.trim() || "(à préciser)"}
+${b.title.trim() ? `- Titre de travail : ${b.title.trim()} (tu peux l'améliorer pour le SEO)\n` : ""}${b.audience.trim() ? `- Public visé : ${b.audience.trim()}\n` : ""}${b.goal.trim() ? `- Objectif de l'article / message clé : ${b.goal.trim()}\n` : ""}${keywords.length ? `- Mots-clés souhaités (le premier est le mot-clé principal) : ${keywords.join(", ")}\n` : "- Mots-clés : choisis toi-même 3 à 10 expressions réellement recherchées, la première étant le mot-clé principal.\n"}- Longueur du corps : environ ${words} mots${withEn ? " par langue" : ""}
+- Langues : ${langs.map((l) => (l === "fr" ? "français (version principale)" : "anglais (adaptation complète, pas une traduction mot à mot)")).join(" et ")}
+${b.tone.trim() ? `- Ton : ${b.tone.trim()}\n` : ""}${b.facts.trim() ? `\n### Informations à intégrer\n${b.facts.trim()}\n` : ""}${b.avoid.trim() ? `\n### À éviter\n${b.avoid.trim()}\n` : ""}${b.sources.trim() ? `\n### Sources à utiliser en priorité\n${b.sources.trim()}\n` : ""}
+## Recherche et fiabilité
+
+${research}
+
+## Règles d'écriture
+
+- Vouvoiement, phrases claires, paragraphes courts, exemples concrets.
+- N'utilise JAMAIS le tiret cadratin « — » ni le tiret demi-cadratin « – » comme ponctuation : utilise des virgules, deux-points ou parenthèses.
+- Pas de témoignages ni de clients inventés, pas de promesses de résultats chiffrés.
+${s.notes.map((n) => `- ${n}`).join("\n")}
+
+## Markdown autorisé dans "body" (le site n'affiche rien d'autre)
+
+- Titres de section « ## » et sous-titres « ### » (jamais « # » ni « #### »). Au moins 4 sections « ## ».
+- Paragraphes séparés par une ligne vide. **gras** et *italique* uniquement avec des astérisques.
+- Listes à puces avec « - » uniquement : pas de listes numérotées, pas de sous-listes.
+- Citations avec « > ».
+- Liens : [texte](/chemin/) pour les pages du site, [texte](https://...) pour les sources.
+- Tableaux Markdown avec ligne d'en-tête puis « | --- | --- | ».
+- Pas de HTML, pas de séparateur « --- », pas d'emoji.
+- Ne répète pas le titre ni l'introduction au début du body : commence directement par un paragraphe d'accroche.
+
+${images}${tables}## Maillage interne
+
+Ajoute 2 à 4 liens internes naturels dans le corps, UNIQUEMENT vers ces adresses (garde le / final) :
+${s.pages.filter((p) => p.path !== "/").map((p) => `- ${p.path === "/" ? "/" : p.path + "/"} : ${p.label}`).join("\n")}
+${posts.map((p) => `- /blog/${p.slug}/ : article « ${p.title} »`).join("\n")}
+Pour la version anglaise, garde exactement les mêmes adresses (le site les adapte tout seul).
+
+## Champs SEO (contraintes strictes)
+
+- "slug" : adresse de l'article en minuscules sans accents, mots séparés par des tirets, 3 à 7 mots, contient le mot-clé principal. Différent de : ${posts.map((p) => p.slug).join(", ")}.
+- "title" : titre H1, 30 à 100 caractères.
+- "seoTitle" : 35 à 65 caractères, commence par le mot-clé principal, sans le nom du site.
+- "description" : meta description de 120 à 160 caractères, avec le mot-clé principal et une promesse concrète.
+- "excerpt" : 100 à 260 caractères, résumé pour la page Blog.
+- "keywords" : 3 à 10 expressions, la première est le mot-clé principal ; il doit apparaître dans title, seoTitle, description, intro et au moins un titre « ## ».
+- "heroEyebrow" : « Catégorie · Sujet court ».
+- "intro" : chapô de 150 à 500 caractères (texte simple, sans Markdown).
+- "keyTakeaways" : 3 à 5 phrases courtes et affirmatives.
+- "faq" : 3 à 6 questions que les lecteurs se posent vraiment, réponses de 40 à 400 caractères (texte simple).
+- "category" : de préférence une de celles-ci (français / anglais) : ${s.categories.map((c) => `${c.fr} / ${c.en}`).join(" ; ")}.
+- "readingTime" : nombre de mots du body divisé par 200, arrondi, suivi de « min ».
+- "relatedSlugs" : 1 ou 2 slugs pris UNIQUEMENT dans cette liste : ${posts.map((p) => p.slug).join(", ")}.
+- "cta" : un appel à l'action adapté au sujet. "primaryHref" et "secondaryHref" doivent être des adresses de la liste du maillage interne, sans le / final (ex. "/contact"). Exemple du ton attendu : « ${s.cta.fr.title} ».
+- "publishedAt" et "updatedAt" : "${day}".
+
+## Format de réponse (obligatoire)
+
+Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sans aucun texte avant ou après, sans commentaires, sans virgule finale. Dans les chaînes, échappe les guillemets doubles (\\") et encode les sauts de ligne en \\n. Structure exacte :
+
+\`\`\`json
+{
+  "format": "blogpost-draft",
+  "version": 1,
+  "site": "${s.id}",
+  "slug": "...",
+  "publishedAt": "${day}",
+  "updatedAt": "${day}",
+  "relatedSlugs": ["..."],
+  "enEnabled": ${withEn},
+  "fr": ${localeTemplate("fr")}${withEn ? `,\n  "en": ${localeTemplate("en")}` : ""}
+}
+\`\`\`
+`;
+  }
+
+  /* ---- strict validation of an imported JSON (AI answer or draft file) ---- */
+
+  function extractJson(text) {
+    const raw = String(text || "").trim();
+    if (!raw) throw new Error("La réponse est vide.");
+    const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+    const candidate = fence ? fence[1] : raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1);
+    if (!candidate.trim().startsWith("{")) throw new Error("Aucun objet JSON trouvé dans la réponse.");
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      const pos = +(String(error.message).match(/position (\d+)/)?.[1] ?? -1);
+      const around = pos >= 0 ? ` Près de : « ${candidate.slice(Math.max(0, pos - 40), pos + 40).replace(/\n/g, "⏎")} »` : "";
+      throw new Error(`JSON invalide (${error.message}).${around}`);
+    }
+  }
+
+  const isStr = (v) => typeof v === "string";
+  const isDate = (v) => isStr(v) && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v));
+
+  function validateDraftJson(obj, { briefImages = [], lenient = false } = {}) {
+    const errors = [];
+    const warnings = [];
+    const fixes = [];
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      return { errors: ["La racine doit être un objet JSON { … }."], warnings, fixes, draft: null };
+    }
+    const siteId = SITES[obj.site] ? obj.site : site().id;
+    if (obj.site && !SITES[obj.site]) errors.push(`"site" vaut « ${obj.site} » : attendu « vhc » ou « karen ».`);
+    else if (obj.site && obj.site !== site().id) warnings.push(`Ce brouillon est pour le site « ${SITES[obj.site].name} » : l'outil bascule sur ce site.`);
+    const s = SITES[siteId];
+    const d = newDraft(siteId);
+    const known = [...s.posts.map((p) => p.slug), ...(state.remoteSlugs[siteId] || [])];
+
+    const str = (path, value, { required = false, min = 0, max = Infinity, label = path, plain = false } = {}) => {
+      if (value == null || value === "") {
+        if (required) errors.push(`"${label}" est obligatoire.`);
+        return "";
+      }
+      if (!isStr(value)) {
+        if (typeof value === "number") { fixes.push(`"${label}" converti en texte.`); value = String(value); }
+        else { errors.push(`"${label}" doit être du texte (reçu : ${Array.isArray(value) ? "liste" : typeof value}).`); return ""; }
+      }
+      let v = value.trim();
+      if (plain && /[*#`]|\]\(/.test(v)) warnings.push(`"${label}" contient du Markdown : il s'affichera tel quel.`);
+      if (v.length && (v.length < min || v.length > max)) warnings.push(`"${label}" : ${v.length} caractères (attendu ${min} à ${max === Infinity ? "∞" : max}).`);
+      return v;
+    };
+    const strList = (value, label, { min = 0, max = Infinity } = {}) => {
+      if (value == null) { if (min) errors.push(`"${label}" est obligatoire (liste).`); return []; }
+      if (isStr(value)) { fixes.push(`"${label}" était un texte : découpé en liste.`); value = value.split(/[,\n]/); }
+      if (!Array.isArray(value)) { errors.push(`"${label}" doit être une liste de textes.`); return []; }
+      const out = [];
+      value.forEach((v, i) => {
+        if (isStr(v) && v.trim()) out.push(v.trim());
+        else if (typeof v === "number") out.push(String(v));
+        else if (v != null && v !== "") errors.push(`"${label}[${i}]" doit être du texte.`);
+      });
+      if (out.length < min || out.length > max) warnings.push(`"${label}" : ${out.length} élément(s) (attendu ${min} à ${max === Infinity ? "∞" : max}).`);
+      return out;
+    };
+
+    const readLocale = (src, lang, required) => {
+      const L = emptyLocale(s.cta[lang]);
+      if (src == null) {
+        if (required) errors.push(`L'objet "${lang}" est absent.`);
+        return L;
+      }
+      if (typeof src !== "object" || Array.isArray(src)) {
+        errors.push(`"${lang}" doit être un objet { … }.`);
+        return L;
+      }
+      const known = new Set(["category", "title", "seoTitle", "description", "excerpt", "readingTime", "keywords", "heroEyebrow", "intro", "keyTakeaways", "faq", "cta", "body"]);
+      Object.keys(src).filter((k) => !known.has(k)).forEach((k) => warnings.push(`Champ inconnu ignoré : "${lang}.${k}".`));
+      const p = (k) => `${lang}.${k}`;
+      L.category = str(p("category"), src.category, { required, label: p("category") });
+      L.title = str(p("title"), src.title, { required, min: 30, max: 100, label: p("title"), plain: true });
+      L.seoTitle = str(p("seoTitle"), src.seoTitle, { required, min: 35, max: 65, label: p("seoTitle"), plain: true });
+      L.description = str(p("description"), src.description, { required, min: 120, max: 160, label: p("description"), plain: true });
+      L.excerpt = str(p("excerpt"), src.excerpt, { min: 100, max: 260, label: p("excerpt"), plain: true });
+      if (!L.excerpt && L.description) { L.excerpt = L.description; fixes.push(`"${p("excerpt")}" vide : la description est reprise.`); }
+      L.heroEyebrow = str(p("heroEyebrow"), src.heroEyebrow, { label: p("heroEyebrow") });
+      L.intro = str(p("intro"), src.intro, { required, min: 150, max: 500, label: p("intro"), plain: true });
+      L.keywords = strList(src.keywords, p("keywords"), { min: 3, max: 10 });
+      L.keyTakeaways = strList(src.keyTakeaways, p("keyTakeaways"), { min: 3, max: 6 });
+      if (src.faq == null) { warnings.push(`"${p("faq")}" absente.`); L.faq = []; }
+      else if (!Array.isArray(src.faq)) { errors.push(`"${p("faq")}" doit être une liste de { "question", "answer" }.`); L.faq = []; }
+      else {
+        L.faq = [];
+        src.faq.forEach((f, i) => {
+          if (!f || typeof f !== "object" || !isStr(f.question) || !isStr(f.answer)) errors.push(`"${p("faq")}[${i}]" doit être { "question": "…", "answer": "…" } en texte.`);
+          else if (f.question.trim() && f.answer.trim()) L.faq.push({ question: f.question.trim(), answer: f.answer.trim() });
+        });
+        if (L.faq.length < 3) warnings.push(`"${p("faq")}" : ${L.faq.length} question(s), 3 recommandées.`);
+      }
+      if (src.cta != null && (typeof src.cta !== "object" || Array.isArray(src.cta))) errors.push(`"${p("cta")}" doit être un objet.`);
+      else if (src.cta) {
+        ["title", "description", "primaryLabel", "primaryHref", "secondaryLabel", "secondaryHref"].forEach((k) => {
+          if (src.cta[k] == null) return;
+          if (!isStr(src.cta[k])) errors.push(`"${p("cta")}.${k}" doit être du texte.`);
+          else L.cta[k] = src.cta[k].trim();
+        });
+        ["primaryHref", "secondaryHref"].forEach((k) => {
+          let href = L.cta[k];
+          if (!href) return;
+          href = href.replace(/^https?:\/\/[^/]+/, "").replace(/(.)\/$/, "$1");
+          if (!s.pages.some((pg) => pg.path === href)) {
+            warnings.push(`"${p("cta")}.${k}" = « ${L.cta[k]} » n'est pas une page connue : remplacé par ${s.cta[lang][k]}.`);
+            href = s.cta[lang][k];
+          }
+          L.cta[k] = href;
+        });
+      } else fixes.push(`"${p("cta")}" absent : appel à l'action par défaut du site.`);
+      if (!L.cta.title || !L.cta.primaryLabel) { L.cta = { ...s.cta[lang], ...Object.fromEntries(Object.entries(L.cta).filter(([, v]) => v)) }; }
+      L.body = str(p("body"), src.body, { required, label: p("body") });
+      if (L.body && !L.body.includes("\n") && L.body.includes("\\n")) { L.body = L.body.replace(/\\n/g, "\n"); fixes.push(`"${p("body")}" : sauts de ligne « \\n » décodés.`); }
+      L.readingTime = str(p("readingTime"), src.readingTime, { label: p("readingTime") });
+      const computed = readingTimeFor(L.body);
+      if (!/^\d+\s?min$/.test(L.readingTime)) { if (L.readingTime) fixes.push(`"${p("readingTime")}" recalculé (${computed}).`); L.readingTime = computed; }
+      if (L.body) {
+        const lint = MD.lint(L.body, { noEmDash: true });
+        const bad = lint.filter((i) => i.level === "error");
+        if (bad.length) warnings.push(`"${p("body")}" : ${bad.length} problème(s) de mise en forme (ex. ligne ${bad[0].n} : ${bad[0].msg})`);
+        const dashes = (JSON.stringify(src).match(/—/g) || []).length;
+        if (dashes) warnings.push(`${lang.toUpperCase()} : ${dashes} tiret(s) cadratin(s) « — » à remplacer.`);
+      }
+      return L;
+    };
+
+    if (obj.format && obj.format !== "blogpost-draft") warnings.push(`"format" inattendu : « ${obj.format} ».`);
+    if (obj.version != null && obj.version !== 1) errors.push(`"version" doit valoir 1.`);
+
+    d.fr = readLocale(obj.fr, "fr", true);
+
+    // Slug
+    let slug = isStr(obj.slug) ? obj.slug.trim() : "";
+    if (slug && !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(slug)) {
+      const fixed = slugify(slug);
+      fixes.push(`"slug" « ${slug} » corrigé en « ${fixed} ».`);
+      slug = fixed;
+    }
+    if (!slug && d.fr.title) { slug = slugify(d.fr.title, true); fixes.push(`"slug" absent : généré depuis le titre (« ${slug} »).`); }
+    if (!slug) errors.push(`"slug" est obligatoire.`);
+    if (slug && known.includes(slug)) warnings.push(`Le slug « ${slug} » existe déjà sur le site : publier remplacerait cet article.`);
+    d.slug = slug;
+    d.slugTouched = true;
+
+    // Dates
+    ["publishedAt", "updatedAt"].forEach((k) => {
+      if (obj[k] == null) { d[k] = today(); fixes.push(`"${k}" absent : date du jour.`); }
+      else if (!isDate(obj[k])) { d[k] = today(); warnings.push(`"${k}" « ${obj[k]} » invalide (format AAAA-MM-JJ) : date du jour.`); }
+      else d[k] = obj[k];
+    });
+    if (d.updatedAt < d.publishedAt) { d.updatedAt = d.publishedAt; fixes.push(`"updatedAt" antérieur à "publishedAt" : aligné.`); }
+
+    // Related
+    const related = strList(obj.relatedSlugs, "relatedSlugs", { min: 0, max: 3 });
+    d.relatedSlugs = related.filter((r) => known.includes(r) && r !== slug);
+    related.filter((r) => !d.relatedSlugs.includes(r)).forEach((r) => warnings.push(`Article lié « ${r} » inconnu : retiré.`));
+
+    // English
+    const wantsEn = obj.enEnabled === true || (obj.enEnabled == null && obj.en != null);
+    if (obj.enEnabled != null && typeof obj.enEnabled !== "boolean") errors.push(`"enEnabled" doit valoir true ou false.`);
+    d.enEnabled = wantsEn;
+    if (wantsEn) d.en = readLocale(obj.en, "en", true);
+    else if (obj.en) warnings.push(`"en" présent mais "enEnabled" vaut false : version anglaise ignorée.`);
+
+    // Images: resolve IMAGE:id placeholders against the brief.
+    d.images = Array.isArray(obj.images) ? obj.images.filter((im) => im && isStr(im.src) && isStr(im.dataUrl) && im.dataUrl.startsWith("data:image/")) : [];
+    const usedNames = new Set();
+    const bodies = ["fr", ...(d.enEnabled ? ["en"] : [])];
+    briefImages.forEach((img) => {
+      let base = slugify(img.description || img.id, true).split("-").slice(0, 6).join("-") || img.id;
+      while (usedNames.has(base)) base += "-2";
+      usedNames.add(base);
+      const src = `/images/blog/${slug || "article"}/${base}.${img.ext || "webp"}`;
+      let placed = false;
+      bodies.forEach((lang) => {
+        const token = new RegExp(`\\(\\s*IMAGE:${img.id}(?=[\\s)"])`, "g");
+        if (token.test(d[lang].body)) {
+          placed = true;
+          d[lang].body = d[lang].body.replace(token, `(${src}`);
+        } else warnings.push(`Image ${img.id} (« ${img.description || "sans description"} ») non placée dans la version ${lang.toUpperCase()} : insérez-la à l'étape Rédaction (bouton « Insérer » dans la liste des images).`);
+      });
+      d.images.push({ src, dataUrl: img.dataUrl, bytes: img.bytes, width: img.width, height: img.height, alt: img.description || "" });
+      if (!placed) fixes.push(`Image ${img.id} gardée dans le brouillon, prête à être insérée.`);
+    });
+    bodies.forEach((lang) => {
+      const left = d[lang].body.match(/IMAGE:[\w-]+/g);
+      if (left) errors.push(`Version ${lang.toUpperCase()} : image(s) inconnue(s) ${[...new Set(left)].join(", ")} (identifiant inventé ou modifié).`);
+    });
+
+    // Unknown root keys
+    const rootKeys = new Set(["format", "version", "site", "slug", "publishedAt", "updatedAt", "relatedSlugs", "enEnabled", "fr", "en", "id", "slugTouched", "editingExisting", "autoReading", "images", "createdAt", "savedAt"]);
+    Object.keys(obj).filter((k) => !rootKeys.has(k)).forEach((k) => warnings.push(`Champ inconnu ignoré : "${k}".`));
+
+    d.autoReading = { fr: false, en: false };
+    if (isStr(obj.id)) d.id = obj.id;
+    if (obj.editingExisting === true) d.editingExisting = true;
+
+    // A draft saved mid-way by this tool may legitimately have empty required fields.
+    if (lenient) {
+      for (let i = errors.length - 1; i >= 0; i--) {
+        if (/obligatoire|est absent/.test(errors[i])) warnings.push(errors.splice(i, 1)[0].replace("est obligatoire", "est vide"));
+      }
+    }
+    // Final safety net: the generated file must parse back exactly as the site will read it.
+    if (!errors.length && d.slug) {
+      try {
+        const roundTrip = MD.parsePostFile(MD.buildPostFile(d));
+        if (roundTrip.front.slug !== d.slug || roundTrip.bodies.fr !== d.fr.body.trim()) errors.push("Le fichier généré ne se relit pas correctement (contrôle interne).");
+      } catch (error) {
+        errors.push(`Le fichier généré serait illisible par le site : ${error.message}`);
+      }
+    }
+    return { errors, warnings, fixes, draft: d };
+  }
+
+  function correctionMessage(report) {
+    return `Ton JSON ne peut pas être importé. Corrige UNIQUEMENT ces points, sans changer le reste du contenu, et renvoie le JSON complet dans un seul bloc \`\`\`json, sans texte autour :\n\n${report.errors.map((e) => `- ${e}`).join("\n")}${
+      report.warnings.length ? `\n\nSi possible, corrige aussi :\n${report.warnings.slice(0, 12).map((w) => `- ${w}`).join("\n")}` : ""
+    }`;
+  }
+
+  function importJsonText(text, { fromBrief = false } = {}) {
+    let obj;
+    try {
+      obj = extractJson(text);
+    } catch (error) {
+      return { errors: [error.message], warnings: [], fixes: [], draft: null, parseError: true };
+    }
+    // A full draft saved by this tool keeps its images; an AI answer uses the brief's.
+    const ownDraft = Boolean(obj && obj.id && obj.createdAt);
+    return validateDraftJson(obj, { briefImages: fromBrief && !ownDraft ? state.brief.images : [], lenient: ownDraft });
+  }
+
+  function applyImportedDraft(report, label) {
+    if (hasContent(state.draft) && state.draft.id !== report.draft.id) saveToDrafts();
+    const siteChanged = state.draft.site !== report.draft.site;
+    state.draft = report.draft;
+    if (siteChanged) loadBrief();
+    applyTheme();
+    autosave();
+    state.screen = "wizard";
+    state.step = "review";
+    render();
+    toast(`${label} importé : vérifiez chaque étape avant de publier.`, "ok");
+  }
+
+  /* ---------------- screens before the wizard ---------------- */
+
+  function renderHome() {
+    const d = state.draft;
+    const cards = Object.values(SITES)
+      .map(
+        (s) => `<button class="home-card" data-action="choose-site" data-site="${s.id}" style="--c-ink:${s.theme.ink};--c-accent:${s.theme.accent};--c-soft:${s.theme.soft};--c-paper:${s.theme.paper}">
+          <span class="home-card-band"></span>
+          <span class="home-card-body">
+            <small>${esc(s.domain.replace("https://", ""))}</small>
+            <strong>${esc(s.name)}</strong>
+            <span>${esc(s.tagline)}</span>
+            <em>${s.posts.length} articles publiés · dépôt ${esc(s.repo)}</em>
+          </span>
+          <span class="home-card-cta">Choisir ce site →</span>
+        </button>`
+      )
+      .join("");
+    return `<div class="screen">
+      <header class="screen-head center">
+        <p class="kicker">Étape 1 sur 2</p>
+        <h1>Pour quel site écrivez-vous&nbsp;?</h1>
+        <p>Le site choisi définit le ton, les catégories, les pages pour les liens internes, le dépôt GitHub et le format des fichiers pour les IA.</p>
+      </header>
+      <div class="home-grid">${cards}</div>
+      ${
+        hasContent(d)
+          ? `<div class="resume card"><div><small class="muted">Brouillon en cours · ${esc(SITES[d.site].name)}</small><strong>${esc(d.fr.title || "(sans titre)")}</strong></div><button class="btn btn-primary" data-action="resume">Reprendre ce brouillon</button></div>`
+          : ""
+      }
+    </div>`;
+  }
+
+  function renderMode() {
+    const s = site();
+    return `<div class="screen">
+      <button class="link-btn back" data-action="screen" data-screen="home">← Changer de site</button>
+      <header class="screen-head center">
+        <p class="kicker">Étape 2 sur 2 · ${esc(s.name)}</p>
+        <h1>Comment voulez-vous écrire l'article&nbsp;?</h1>
+      </header>
+      <div class="mode-grid">
+        <button class="mode-card" data-action="mode" data-mode="manual">
+          <span class="mode-icon" aria-hidden="true">✍️</span>
+          <strong>Rédiger moi-même</strong>
+          <span>Le constructeur pas à pas : vous écrivez chaque champ, avec la barre d'outils, l'aperçu et les contrôles SEO en direct.</span>
+          <ul><li>Contrôle total du texte</li><li>Idéal pour modifier un article existant</li><li>Images, tableaux, liens, FAQ</li></ul>
+          <em>Ouvrir le constructeur →</em>
+        </button>
+        <button class="mode-card featured" data-action="mode" data-mode="ai">
+          <span class="mode-icon" aria-hidden="true">✨</span>
+          <strong>Rédiger avec l'IA</strong>
+          <span>Vous remplissez un court brief, l'outil génère le prompt à coller dans Claude ou ChatGPT, puis vous importez sa réponse.</span>
+          <ul><li>Article complet, recherché et sourcé</li><li>Français et anglais, SEO inclus</li><li>Vos images et tableaux placés où vous voulez</li></ul>
+          <em>Préparer le brief →</em>
+        </button>
+      </div>
+    </div>`;
+  }
+
+  function briefField({ label, key, rows = 0, placeholder = "", hint = "", required = false }) {
+    const value = state.brief[key] ?? "";
+    const control = rows
+      ? `<textarea data-brief="${key}" rows="${rows}" placeholder="${esc(placeholder)}">${esc(value)}</textarea>`
+      : `<input type="text" data-brief="${key}" value="${esc(value)}" placeholder="${esc(placeholder)}" />`;
+    return `<label class="field"><span class="field-label">${label}${required ? ' <b class="req">*</b>' : ""}</span>${control}${hint ? `<small class="hint">${hint}</small>` : ""}</label>`;
+  }
+
+  const PLACEMENTS = ["Juste après le premier paragraphe", "Dans la section qui en parle le plus", "Avant la conclusion", "En illustration du tableau"];
+
+  function renderAi() {
+    const s = site();
+    const b = state.brief;
+    const report = state.aiReport;
+    return `<div class="screen wide">
+      <button class="link-btn back" data-action="screen" data-screen="mode">← Retour au choix</button>
+      <header class="screen-head">
+        <p class="kicker">${esc(s.name)} · Rédaction avec l'IA</p>
+        <h1>Préparer l'article avec l'IA</h1>
+        <p>Remplissez le brief, copiez le prompt dans Claude ou ChatGPT, puis importez la réponse. L'outil vérifie tout, place vos images, et vous publiez comme d'habitude.</p>
+      </header>
+      <ol class="ai-steps">
+        <li class="card">
+          <h3><span class="badge">1</span> Le sujet</h3>
+          ${briefField({ label: "Sujet / angle de recherche", key: "subject", rows: 3, required: true, placeholder: s.id === "vhc" ? "Ex. Pourquoi les promoteurs perdent des ventes entre le premier contact et la réservation, et comment y remédier" : "Ex. Comment reconnaître une anxiété de performance au travail et quand consulter", hint: "Le plus précis possible : la question à laquelle l'article répond." })}
+          <div class="grid-2">
+            ${briefField({ label: "Titre de travail (facultatif)", key: "title", placeholder: "L'IA peut l'améliorer pour le SEO" })}
+            ${briefField({ label: "Public visé", key: "audience", placeholder: s.id === "vhc" ? "Dirigeants de PME, directeurs commerciaux" : "Adultes actifs, cadres" })}
+          </div>
+          ${briefField({ label: "Objectif / message clé", key: "goal", rows: 2, placeholder: "Ce que le lecteur doit retenir ou faire après la lecture" })}
+          ${briefField({ label: "Mots-clés souhaités (facultatif)", key: "keywords", placeholder: "séparés par des virgules, le premier = principal", hint: "Laissez vide pour que l'IA les choisisse." })}
+        </li>
+        <li class="card">
+          <h3><span class="badge">2</span> Langues, longueur et sources</h3>
+          <div class="grid-3">
+            <div class="field"><span class="field-label">Langues</span>
+              <label class="inline-check"><input type="checkbox" checked disabled /> Français (principal)</label><br/>
+              <label class="inline-check"><input type="checkbox" data-brief-lang="en" ${b.languages.en ? "checked" : ""}/> Anglais</label>
+            </div>
+            <label class="field"><span class="field-label">Longueur du texte</span>
+              <select data-brief="length">${[["900", "Courte · ~900 mots"], ["1400", "Standard · ~1 400 mots"], ["2000", "Approfondie · ~2 000 mots"], ["2600", "Guide complet · ~2 600 mots"]].map(([v, l]) => `<option value="${v}" ${b.length === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+            </label>
+            ${briefField({ label: "Ton (facultatif)", key: "tone", placeholder: s.id === "vhc" ? "expert, direct, concret" : "chaleureux, rassurant, nuancé" })}
+          </div>
+          <label class="inline-check"><input type="checkbox" data-brief-check="research" ${b.research ? "checked" : ""}/> Demander une recherche avec sources vérifiables (section « Sources » en fin d'article)</label>
+          <div class="grid-2 mt">
+            ${briefField({ label: "Sources à utiliser (facultatif)", key: "sources", rows: 3, placeholder: "Une adresse ou une référence par ligne" })}
+            ${briefField({ label: "Informations à intégrer (facultatif)", key: "facts", rows: 3, placeholder: "Chiffres internes, offre à mettre en avant, exemple vécu…" })}
+          </div>
+          ${briefField({ label: "À éviter (facultatif)", key: "avoid", rows: 2, placeholder: "Sujets, formulations ou promesses à ne pas faire" })}
+        </li>
+        <li class="card">
+          <h3><span class="badge">3</span> Images <small class="muted">(facultatif)</small></h3>
+          <p class="muted small">Importez vos images et dites ce qu'elles montrent et où les placer. Elles sont converties en WebP et l'IA place un repère à l'endroit voulu ; à l'import, l'outil remplace ce repère par la vraie image.</p>
+          <label class="drop"><input type="file" accept="image/*" multiple data-action="brief-images" hidden /><strong>Ajouter des images</strong><span>JPG, PNG ou WebP · plusieurs à la fois</span></label>
+          <datalist id="placements">${PLACEMENTS.map((p) => `<option value="${esc(p)}"></option>`).join("")}</datalist>
+          ${b.images
+            .map(
+              (img, i) => `<div class="brief-item">
+                <img src="${img.dataUrl}" alt="" />
+                <div class="brief-item-fields">
+                  <div class="row-between"><code>${img.id}</code><small class="muted">${img.width}×${img.height} · ${Math.round(img.bytes / 1024)} Ko</small></div>
+                  <input type="text" data-brief-img="${i}" data-key="description" value="${esc(img.description)}" placeholder="Ce que montre l'image (sert au texte alternatif) *" />
+                  <input type="text" data-brief-img="${i}" data-key="placement" value="${esc(img.placement)}" list="placements" placeholder="Où la placer ? (ex. dans la section sur le suivi des prospects)" />
+                  <input type="text" data-brief-img="${i}" data-key="caption" value="${esc(img.caption)}" placeholder="Légende affichée sous l'image (facultatif)" />
+                </div>
+                <button class="icon-btn" data-action="brief-image-remove" data-index="${i}" title="Retirer">×</button>
+              </div>`
+            )
+            .join("")}
+        </li>
+        <li class="card">
+          <h3><span class="badge">4</span> Tableaux <small class="muted">(facultatif)</small></h3>
+          <p class="muted small">Collez un tableau depuis Excel, Google Sheets ou Word (ou en CSV). L'IA l'insère tel quel à l'endroit indiqué.</p>
+          ${b.tables
+            .map(
+              (t, i) => `<div class="brief-table">
+                <div class="row-between"><code>${t.id}</code><button class="link-btn danger" data-action="brief-table-remove" data-index="${i}">Retirer</button></div>
+                <div class="grid-2">
+                  <input type="text" data-brief-table="${i}" data-key="title" value="${esc(t.title)}" placeholder="De quoi parle ce tableau ?" />
+                  <input type="text" data-brief-table="${i}" data-key="placement" value="${esc(t.placement)}" list="placements" placeholder="Où le placer ?" />
+                </div>
+                <textarea rows="4" data-brief-table="${i}" data-key="paste" placeholder="Collez les cellules ici">${esc(t.paste || "")}</textarea>
+                <div class="prose table-preview" data-table-preview="${i}">${t.markdown ? MD.toHtml(t.markdown) : '<p class="muted small">L\'aperçu du tableau apparaîtra ici.</p>'}</div>
+              </div>`
+            )
+            .join("")}
+          <button class="btn btn-ghost" data-action="brief-table-add">+ Ajouter un tableau</button>
+        </li>
+        <li class="card prompt-card">
+          <h3><span class="badge">5</span> Le prompt à copier</h3>
+          ${b.subject.trim() ? "" : '<p class="check check-warn"><span class="dot"></span>Renseignez au moins le sujet (étape 1).</p>'}
+          ${b.images.some((im) => !im.description.trim()) ? '<p class="check check-warn"><span class="dot"></span>Décrivez chaque image : l\'IA s\'en sert pour le texte alternatif et l\'emplacement.</p>' : ""}
+          <textarea class="prompt-box" id="prompt-box" readonly>${esc(buildPrompt())}</textarea>
+          <div class="row-between">
+            <small class="muted" id="prompt-size"></small>
+            <div class="row-actions">
+              <button class="btn btn-primary" data-action="copy-prompt">Copier le prompt</button>
+              <a class="btn btn-ghost" href="https://claude.ai/new" target="_blank" rel="noopener">Ouvrir Claude ↗</a>
+              <a class="btn btn-ghost" href="https://chatgpt.com/" target="_blank" rel="noopener">Ouvrir ChatGPT ↗</a>
+            </div>
+          </div>
+          <details class="mt"><summary>Conseils</summary>
+            <ul class="checks plain">
+              <li>Activez la recherche web (Claude : « Recherche » ; ChatGPT : « Rechercher ») pour des sources réelles.</li>
+              <li>Les images ne sont pas envoyées à l'IA : seule leur description l'est. Elles restent dans votre navigateur.</li>
+              <li>Si la réponse est coupée, écrivez « continue » puis collez la réponse complète ci-dessous.</li>
+              <li>Relisez toujours le texte : vous publiez sous votre nom.</li>
+            </ul>
+          </details>
+        </li>
+        <li class="card">
+          <h3><span class="badge">6</span> Importer la réponse de l'IA</h3>
+          <p class="muted small">Collez toute la réponse (le bloc \`\`\`json suffit) ou chargez un fichier .json. L'outil valide la structure champ par champ avant d'importer.</p>
+          <textarea rows="7" data-brief="response" class="mono" placeholder='\`\`\`json\n{ "format": "blogpost-draft", … }\n\`\`\`'>${esc(b.response)}</textarea>
+          <div class="row-actions mt">
+            <button class="btn btn-primary" data-action="ai-validate">Vérifier et importer</button>
+            <label class="btn btn-ghost"><input type="file" accept=".json,application/json,.txt" data-action="ai-file" hidden />Charger un fichier .json</label>
+          </div>
+          <div id="ai-report">${report ? renderReport(report) : ""}</div>
+        </li>
+      </ol>
+    </div>`;
+  }
+
+  function renderReport(r) {
+    const list = (items, cls) => (items.length ? `<ul class="checks">${items.map((m) => `<li class="check check-${cls}"><span class="dot"></span><span>${esc(m)}</span></li>`).join("")}</ul>` : "");
+    if (r.errors.length) {
+      return `<div class="report report-error">
+        <h4>${r.errors.length} erreur(s) bloquante(s) : rien n'a été importé</h4>
+        ${list(r.errors, "error")}
+        ${r.warnings.length ? `<h4 class="mt">Avertissements</h4>${list(r.warnings, "warn")}` : ""}
+        <div class="row-actions mt"><button class="btn btn-primary" data-action="copy-correction">Copier un message de correction pour l'IA</button></div>
+        <p class="muted small">Collez ce message dans la même conversation : l'IA renverra un JSON corrigé, à recoller ici.</p>
+      </div>`;
+    }
+    return `<div class="report report-ok">
+      <h4>Structure valide</h4>
+      ${r.fixes.length ? `<p class="muted small">Corrigé automatiquement :</p>${list(r.fixes, "ok")}` : ""}
+      ${r.warnings.length ? `<p class="muted small">À vérifier après l'import :</p>${list(r.warnings, "warn")}` : ""}
+      <div class="row-actions mt"><button class="btn btn-primary" data-action="ai-apply">Importer et vérifier l'article →</button></div>
+    </div>`;
+  }
+
+  function refreshPrompt() {
+    const box = $("#prompt-box");
+    if (!box) return;
+    box.value = buildPrompt();
+    const size = $("#prompt-size");
+    if (size) size.textContent = `${box.value.length.toLocaleString("fr-FR")} caractères`;
+  }
+
+  function renderScreen() {
+    if (state.screen === "home") return renderHome();
+    if (state.screen === "mode") return renderMode();
+    return renderAi();
+  }
+
   /* ---------------- main render ---------------- */
 
   const RENDERERS = {
@@ -1119,6 +1802,17 @@
   function render({ keepScroll = false } = {}) {
     const main = $("#main");
     const scroll = window.scrollY;
+    const full = state.screen !== "wizard";
+    document.body.classList.toggle("screen-full", full);
+    try {
+      sessionStorage.setItem(STORE_SCREEN, state.screen);
+    } catch {}
+    if (full) {
+      main.innerHTML = renderScreen();
+      refreshPrompt();
+      window.scrollTo(0, keepScroll ? scroll : 0);
+      return;
+    }
     main.innerHTML = RENDERERS[state.step]();
     renderSidebar();
     const stepInfo = STEPS.find((s) => s.id === state.step);
@@ -1139,8 +1833,19 @@
   }
 
   function go(step) {
+    state.screen = "wizard";
     state.step = step;
     render();
+  }
+
+  function startSite(id) {
+    if (id !== state.draft.site) {
+      if (hasContent(state.draft)) saveToDrafts();
+      state.draft = newDraft(id);
+      autosave();
+    }
+    applyTheme();
+    loadBrief();
   }
 
   /* ---------------- editor helpers ---------------- */
@@ -1333,7 +2038,7 @@
           const base = slugify(String(f.get("filename") || "") || alt, true) || `image-${d.images.length + 1}`;
           src = `/images/blog/${d.slug}/${base}.${processed.ext}`;
           d.images = d.images.filter((img) => img.src !== src);
-          d.images.push({ src, dataUrl: processed.dataUrl, bytes: processed.bytes, width: processed.width, height: processed.height });
+          d.images.push({ src, dataUrl: processed.dataUrl, bytes: processed.bytes, width: processed.width, height: processed.height, alt });
         } else if (kind === "site") {
           src = String(f.get("sitepath")).trim();
           if (!src.startsWith("/")) throw new Error("Le chemin doit commencer par / (ex. /images/photo.webp).");
@@ -1782,6 +2487,28 @@ A 2 or 3 sentence summary, leading to how you can help.
   function bindEvents() {
     document.addEventListener("input", (e) => {
       const t = e.target;
+      if (t.dataset.brief) {
+        state.brief[t.dataset.brief] = t.value;
+        saveBrief();
+        if (t.dataset.brief !== "response") refreshPrompt();
+        else state.aiReport = null;
+      }
+      if (t.dataset.briefImg) {
+        state.brief.images[+t.dataset.briefImg][t.dataset.key] = t.value;
+        saveBrief();
+        refreshPrompt();
+      }
+      if (t.dataset.briefTable) {
+        const tb = state.brief.tables[+t.dataset.briefTable];
+        tb[t.dataset.key] = t.value;
+        if (t.dataset.key === "paste") {
+          tb.markdown = toMarkdownTable(t.value);
+          const pv = $(`[data-table-preview="${t.dataset.briefTable}"]`);
+          if (pv) pv.innerHTML = tb.markdown ? MD.toHtml(tb.markdown) : "";
+        }
+        saveBrief();
+        refreshPrompt();
+      }
       if (t.dataset.bind) onBindInput(t);
       if (t.dataset.gh && t.type !== "radio" && t.type !== "checkbox") {
         const cfg = ghSettings();
@@ -1795,6 +2522,50 @@ A 2 or 3 sentence summary, leading to how you can help.
 
     document.addEventListener("change", (e) => {
       const t = e.target;
+      if (t.dataset.briefLang) {
+        state.brief.languages[t.dataset.briefLang] = t.checked;
+        saveBrief();
+        refreshPrompt();
+      }
+      if (t.dataset.briefCheck) {
+        state.brief[t.dataset.briefCheck] = t.checked;
+        saveBrief();
+        refreshPrompt();
+      }
+      if (t.tagName === "SELECT" && t.dataset.brief) {
+        state.brief[t.dataset.brief] = t.value;
+        saveBrief();
+        refreshPrompt();
+      }
+      if (t.dataset.action === "brief-images") {
+        const files = Array.from(t.files || []);
+        t.value = "";
+        (async () => {
+          for (const file of files) {
+            try {
+              const img = await fileToWebp(file);
+              const n = Math.max(0, ...state.brief.images.map((x) => +x.id.split("-")[1] || 0)) + 1;
+              state.brief.images.push({ id: `img-${n}`, ...img, description: "", placement: "", caption: "" });
+            } catch (error) {
+              toast(`${file.name} : ${error.message}`, "error");
+            }
+          }
+          saveBrief();
+          render({ keepScroll: true });
+        })();
+        return;
+      }
+      if (t.dataset.action === "ai-file") {
+        readFile(t, (text) => {
+          state.brief.response = text;
+          saveBrief();
+          state.aiReport = importJsonText(text, { fromBrief: true });
+          state.aiPending = state.aiReport;
+          render({ keepScroll: true });
+          $("#ai-report")?.scrollIntoView({ block: "start", behavior: "smooth" });
+        });
+        return;
+      }
       if (t.dataset.bindCheck) {
         setPath(state.draft, t.dataset.bindCheck, t.checked);
         if (t.dataset.bindCheck.startsWith("autoReading") && t.checked) {
@@ -1823,9 +2594,8 @@ A 2 or 3 sentence summary, leading to how you can help.
       const action = t.dataset.action;
       if (action === "load-draft-file")
         readFile(t, (text) => {
-          loadDraftObject(JSON.parse(text));
-          toast("Brouillon chargé.", "ok");
-          go("article");
+          const report = importJsonText(text, { fromBrief: true });
+          showReportModal(report, report.errors.length ? "Ce fichier ne peut pas être importé" : "Vérification du fichier");
         });
       if (action === "import-md-file") {
         if (hasContent(state.draft) && !confirm("Remplacer le brouillon en cours ? (Pensez à « Enregistrer » avant.)")) {
@@ -1875,6 +2645,73 @@ A 2 or 3 sentence summary, leading to how you can help.
       const d = state.draft;
       const handlers = {
         go: () => go(el.dataset.step),
+        "go-home": () => {
+          state.screen = "home";
+          render();
+        },
+        screen: () => {
+          state.screen = el.dataset.screen;
+          render();
+        },
+        "choose-site": () => {
+          startSite(el.dataset.site);
+          state.screen = "mode";
+          render();
+        },
+        resume: () => {
+          applyTheme();
+          loadBrief();
+          go(state.step === "start" ? "article" : state.step);
+        },
+        mode: () => {
+          if (el.dataset.mode === "ai") {
+            state.screen = "ai";
+            render();
+            return;
+          }
+          go(hasContent(state.draft) ? "start" : "article");
+        },
+        "brief-image-remove": () => {
+          state.brief.images.splice(+el.dataset.index, 1);
+          saveBrief();
+          render({ keepScroll: true });
+        },
+        "brief-table-add": () => {
+          const n = Math.max(0, ...state.brief.tables.map((x) => +x.id.split("-")[1] || 0)) + 1;
+          state.brief.tables.push({ id: `tab-${n}`, title: "", placement: "", paste: "", markdown: "" });
+          saveBrief();
+          render({ keepScroll: true });
+        },
+        "brief-table-remove": () => {
+          state.brief.tables.splice(+el.dataset.index, 1);
+          saveBrief();
+          render({ keepScroll: true });
+        },
+        "copy-prompt": () => {
+          if (!state.brief.subject.trim()) {
+            toast("Renseignez d'abord le sujet (étape 1).", "error");
+            return;
+          }
+          copy(buildPrompt());
+        },
+        "ai-validate": () => {
+          state.aiReport = importJsonText(state.brief.response, { fromBrief: true });
+          render({ keepScroll: true });
+          $("#ai-report")?.scrollIntoView({ block: "start", behavior: "smooth" });
+        },
+        "ai-apply": () => {
+          if (!state.aiReport || state.aiReport.errors.length) return;
+          applyImportedDraft(state.aiReport, "Article de l'IA");
+          state.aiReport = null;
+        },
+        "copy-correction": () => state.aiReport && copy(correctionMessage(state.aiReport)),
+        "image-insert": () => {
+          const img = d.images[+el.dataset.index];
+          const loc = state.step === "english" ? "en" : "fr";
+          const ta = activeEditor(loc);
+          if (!ta) return toast("Ouvrez l'éditeur (étape Rédaction) pour insérer l'image.", "error");
+          insertBlock(ta, `![${(img.alt || "Décrivez l'image").replace(/[\[\]]/g, "")}](${img.src})`);
+        },
         "pick-site": () => {
           const id = el.dataset.site;
           if (id === d.site) return;
@@ -2082,7 +2919,12 @@ A 2 or 3 sentence summary, leading to how you can help.
       const step = sessionStorage.getItem(STORE_STEP);
       if (step && RENDERERS[step]) state.step = step;
     } catch {}
+    try {
+      const screen = sessionStorage.getItem(STORE_SCREEN);
+      if (["home", "mode", "ai", "wizard"].includes(screen)) state.screen = screen;
+    } catch {}
     applyTheme();
+    loadBrief();
     bindEvents();
     render();
     renderSaveStatus();

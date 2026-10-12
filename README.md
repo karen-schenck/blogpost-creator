@@ -7,6 +7,17 @@ Static page that builds a publish-ready blog post, step by step, for:
 
 No build, no dependencies, no server: open `index.html` or the GitHub Pages URL.
 
+## Flow
+
+1. **Choose the site** (grid of the two sites).
+2. **Choose the mode**: write it yourself (the step-by-step builder) or **write it with AI**.
+3. **With AI**: fill a brief (subject, title, audience, goal, keywords, languages, length, tone, research and sources, facts to include, things to avoid), add images with a description, a placement and a caption, and paste tables. The page builds a prompt for Claude or ChatGPT that asks for a JSON draft in the exact structure (`"format": "blogpost-draft"`), with the site's SEO rules, supported Markdown, internal pages, existing posts and CTA targets. Images are not sent to the AI: it places `IMAGE:img-1` markers, replaced on import by the real `/images/blog/<slug>/…webp` paths.
+4. **Import the answer**: every JSON (AI answer or draft file) goes through a strict validator before anything is imported:
+   - blocking errors (invalid JSON with the error position, wrong types, missing required fields, unknown image ids, a file the site could not read back) stop the import and produce a ready-to-paste correction message for the AI;
+   - safe fixes are applied and listed (slug normalised, reading time recomputed, unknown CTA pages and related posts replaced or removed, escaped line breaks decoded);
+   - SEO length issues and formatting problems are reported as warnings.
+5. The imported article opens on **Vérification**, then **Publier** (one commit with the post, images and llms updates).
+
 ## What it does
 
 1. **Démarrer**: pick the site, resume a draft, load a `.json` draft, or import an existing `data/blogs/<slug>.md` (from a file or from GitHub) to edit it.
