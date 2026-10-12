@@ -37,6 +37,7 @@
     brief: null,
     aiReport: null,
     aiPending: null,
+    edit: null,
   };
 
   /* ---------------- utilities ---------------- */
@@ -428,7 +429,7 @@
     return `${stepHeader("Démarrer", "Reprenez un brouillon, importez un article existant ou commencez un nouvel article. Tout est enregistré automatiquement dans ce navigateur.")}
       <section class="card row-between">
         <div><h3>1. Site</h3><p class="muted">${esc(site().name)} · ${esc(site().domain.replace("https://", ""))}</p></div>
-        <div class="row-actions"><button class="btn btn-ghost" data-action="screen" data-screen="home">Changer de site</button><button class="btn btn-ghost" data-action="mode" data-mode="ai">✨ Rédiger avec l'IA</button></div>
+        <div class="row-actions"><button class="btn btn-ghost" data-action="screen" data-screen="home">Changer de site</button><button class="btn btn-ghost" data-action="mode" data-mode="ai">✨ Rédiger avec l'IA</button><button class="btn btn-ghost" data-action="mode" data-mode="edit">🛠️ Modifier un article publié</button></div>
       </section>
 
       <section class="card">
@@ -1134,16 +1135,62 @@
   }
 
   // Tab/CSV/Markdown pasted from a spreadsheet -> Markdown pipe table.
-  function toMarkdownTable(text) {
+  // CSV / TSV parser: quoted fields, "" escapes, line breaks inside quotes, delimiter auto-detected.
+  function parseCsv(text) {
+    const src = String(text || "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+    const firstLine = src.split("\n").find((l) => l.trim()) || "";
+    const count = (ch) => (firstLine.match(new RegExp(ch === "\t" ? "\t" : `\\${ch}`, "g")) || []).length;
+    const delim = ["\t", ";", ","].sort((a, b) => count(b) - count(a))[0];
+    const rows = [];
+    let row = [], cell = "", quoted = false;
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (quoted) {
+        if (ch === '"' && src[i + 1] === '"') { cell += '"'; i++; }
+        else if (ch === '"') quoted = false;
+        else cell += ch;
+      } else if (ch === '"' && cell.trim() === "") { quoted = true; cell = ""; }
+      else if (ch === delim) { row.push(cell.trim()); cell = ""; }
+      else if (ch === "\n") { row.push(cell.trim()); rows.push(row); row = []; cell = ""; }
+      else cell += ch;
+    }
+    if (cell.trim() || row.length) { row.push(cell.trim()); rows.push(row); }
+    return rows.filter((r) => r.some((c) => c !== ""));
+  }
+
+  function tableRows(text) {
     const raw = String(text || "").trim();
-    if (!raw) return "";
+    if (!raw) return [];
     const lines = raw.split(/\r?\n/).filter((l) => l.trim());
     if (lines.every((l) => l.trim().startsWith("|"))) {
-      const rows = lines.filter((l) => !/^\|(?:\s*:?-+:?\s*\|)+$/.test(l.trim())).map((l) => l.trim().slice(1, -1).split("|").map((c) => c.trim()));
-      return rowsToMarkdown(rows);
+      return lines.filter((l) => !/^\|(?:\s*:?-+:?\s*\|)+$/.test(l.trim())).map((l) => l.trim().slice(1, -1).split("|").map((c) => c.trim()));
     }
-    const sep = lines[0].includes("\t") ? "\t" : lines[0].includes(";") ? ";" : ",";
-    return rowsToMarkdown(lines.map((l) => l.split(sep).map((c) => c.trim().replace(/^"|"$/g, ""))));
+    return parseCsv(raw);
+  }
+
+  function toMarkdownTable(text) {
+    return rowsToMarkdown(tableRows(text));
+  }
+
+  function rowsToCsv(rows) {
+    return rows.map((r) => r.map((c) => (/[",;\n]/.test(c) ? `"${String(c).replace(/"/g, '""')}"` : c)).join(",")).join("\n");
+  }
+
+  // Large tables are not copied into the prompt: the AI places a marker and the tool inserts the data.
+  const BIG_TABLE_ROWS = 15;
+  const BIG_TABLE_CHARS = 2500;
+  function isBigTable(t) {
+    return (t.rows || 0) > BIG_TABLE_ROWS || (t.markdown || "").length > BIG_TABLE_CHARS;
+  }
+
+  function updateTable(t, text) {
+    t.paste = text;
+    const rows = tableRows(text);
+    t.rows = Math.max(0, rows.length - 1);
+    t.cols = rows.length ? Math.max(...rows.map((r) => r.length)) : 0;
+    t.headers = rows[0] || [];
+    t.markdown = rowsToMarkdown(rows);
+    t.csv = rowsToCsv(rows);
   }
 
   function rowsToMarkdown(rows) {
@@ -1209,25 +1256,43 @@ ${b.images
 `
       : "";
 
-    const tables = b.tables.filter((t) => t.markdown.trim()).length
+    const filled = b.tables.filter((t) => (t.markdown || "").trim());
+    const small = filled.filter((t) => !isBigTable(t));
+    const big = filled.filter(isBigTable);
+    const tables = filled.length
       ? `## Tableaux fournis (obligatoires)
+${
+  small.length
+    ? `
+Insère chacun de ces tableaux tel quel (mêmes données, mêmes colonnes), au format Markdown ci-dessous, avec une ligne vide avant et après. Tu peux ajouter une phrase d'introduction avant le tableau.${withEn ? " Pour la version anglaise, traduis les en-têtes et les textes, pas les chiffres." : ""}
 
-Insère chaque tableau tel quel (mêmes données, mêmes colonnes), au format Markdown ci-dessous, avec une ligne vide avant et après. Tu peux ajouter une phrase d'introduction avant le tableau.${withEn ? " Pour la version anglaise, traduis les en-têtes et les textes, pas les chiffres." : ""}
+${small.map((t) => `### ${t.id}${t.title ? ` : ${t.title}` : ""}\nEmplacement : ${t.placement || "à toi de choisir l'endroit le plus pertinent"}\n\n${t.markdown}`).join("\n\n")}
+`
+    : ""
+}${
+  big.length
+    ? `
+Grands tableaux : NE LES RECOPIE PAS. À l'endroit voulu, écris uniquement le repère [[TABLE:identifiant]] seul sur sa ligne, avec une ligne vide avant et après${withEn ? ", dans chaque langue" : ""} : l'outil insérera le tableau complet. Le fichier complet est joint à la conversation : utilise-le pour analyser les données et commenter les chiffres importants dans le texte (sans inventer de valeurs).
 
-${b.tables
-  .filter((t) => t.markdown.trim())
-  .map((t) => `### ${t.id}${t.title ? ` : ${t.title}` : ""}\nEmplacement : ${t.placement || "à toi de choisir l'endroit le plus pertinent"}\n\n${t.markdown}`)
+${big
+  .map((t) => {
+    const preview = rowsToMarkdown(tableRows(t.paste).slice(0, 6));
+    return `### ${t.id}${t.title ? ` : ${t.title}` : ""}\nFichier joint : ${t.fileName || `${t.id}.csv`} (${t.rows} lignes, ${t.cols} colonnes)\nColonnes : ${(t.headers || []).join(", ")}\nEmplacement : ${t.placement || "à toi de choisir l'endroit le plus pertinent"}\nAperçu des premières lignes :\n\n${preview}`;
+  })
   .join("\n\n")}
 `
+    : ""
+}`
       : "";
 
     const research = b.research
       ? `Fais une recherche sérieuse avant d'écrire (utilise la recherche web si tu y as accès). Appuie-toi sur des sources fiables et vérifiables : études, organismes officiels, presse reconnue. N'invente AUCUN chiffre, AUCUNE étude, AUCUNE citation et AUCUNE source. Si tu ne peux pas vérifier une donnée, ne l'utilise pas. Termine le corps par une section « ## Sources » listant les sources réellement utilisées sous forme de liens Markdown.`
       : `N'invente aucun chiffre, aucune étude ni aucune source. N'utilise que des informations sûres ou celles fournies ci-dessous.`;
 
+    const attachments = big.map((t) => t.fileName || `${t.id}.csv`);
     return `Tu es un rédacteur web expert en SEO. Tu écris un article de blog pour le site ${s.domain} (${s.brand} : ${s.tagline}).
 Ta réponse sera importée automatiquement dans un outil : elle doit respecter EXACTEMENT le format demandé à la fin.
-
+${attachments.length ? `Fichiers joints à ce message : ${attachments.join(", ")}.\n` : ""}
 ## Le brief
 
 - Sujet / angle : ${b.subject.trim() || "(à préciser)"}
@@ -1321,7 +1386,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
   const isStr = (v) => typeof v === "string";
   const isDate = (v) => isStr(v) && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v));
 
-  function validateDraftJson(obj, { briefImages = [], lenient = false } = {}) {
+  function validateDraftJson(obj, { briefImages = [], briefTables = [], lenient = false } = {}) {
     const errors = [];
     const warnings = [];
     const fixes = [];
@@ -1488,7 +1553,22 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
       d.images.push({ src, dataUrl: img.dataUrl, bytes: img.bytes, width: img.width, height: img.height, alt: img.description || "" });
       if (!placed) fixes.push(`Image ${img.id} gardée dans le brouillon, prête à être insérée.`);
     });
+    // Large tables: [[TABLE:id]] markers replaced by the full data.
+    briefTables.filter((t) => t.markdown && isBigTable(t)).forEach((t) => {
+      bodies.forEach((lang) => {
+        const marker = new RegExp(`^[ \\t]*\\[\\[\\s*TABLE:${t.id}\\s*\\]\\][ \\t]*$`, "m");
+        if (marker.test(d[lang].body)) d[lang].body = d[lang].body.replace(marker, t.markdown);
+        else {
+          const body = d[lang].body;
+          const at = body.search(/\n## Sources\b/);
+          d[lang].body = at === -1 ? `${body.trimEnd()}\n\n${t.markdown}\n` : `${body.slice(0, at)}\n\n${t.markdown}\n${body.slice(at)}`;
+          fixes.push(`Tableau ${t.id} non placé par l'IA (${lang.toUpperCase()}) : ajouté ${at === -1 ? "à la fin" : "avant les sources"}, déplacez-le si besoin.`);
+        }
+      });
+    });
     bodies.forEach((lang) => {
+      const leftTables = d[lang].body.match(/\[\[\s*TABLE:[\w-]+\s*\]\]/g);
+      if (leftTables) errors.push(`Version ${lang.toUpperCase()} : repère(s) de tableau inconnu(s) ${[...new Set(leftTables)].join(", ")}.`);
       const left = d[lang].body.match(/IMAGE:[\w-]+/g);
       if (left) errors.push(`Version ${lang.toUpperCase()} : image(s) inconnue(s) ${[...new Set(left)].join(", ")} (identifiant inventé ou modifié).`);
     });
@@ -1534,7 +1614,8 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
     }
     // A full draft saved by this tool keeps its images; an AI answer uses the brief's.
     const ownDraft = Boolean(obj && obj.id && obj.createdAt);
-    return validateDraftJson(obj, { briefImages: fromBrief && !ownDraft ? state.brief.images : [], lenient: ownDraft });
+    const useBrief = fromBrief && !ownDraft;
+    return validateDraftJson(obj, { briefImages: useBrief ? state.brief.images : [], briefTables: useBrief ? state.brief.tables : [], lenient: ownDraft });
   }
 
   function applyImportedDraft(report, label) {
@@ -1589,7 +1670,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
       <button class="link-btn back" data-action="screen" data-screen="home">← Changer de site</button>
       <header class="screen-head center">
         <p class="kicker">Étape 2 sur 2 · ${esc(s.name)}</p>
-        <h1>Comment voulez-vous écrire l'article&nbsp;?</h1>
+        <h1>Que voulez-vous faire&nbsp;?</h1>
       </header>
       <div class="mode-grid">
         <button class="mode-card" data-action="mode" data-mode="manual">
@@ -1606,6 +1687,13 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
           <ul><li>Article complet, recherché et sourcé</li><li>Français et anglais, SEO inclus</li><li>Vos images et tableaux placés où vous voulez</li></ul>
           <em>Préparer le brief →</em>
         </button>
+        <button class="mode-card" data-action="mode" data-mode="edit">
+          <span class="mode-icon" aria-hidden="true">🛠️</span>
+          <strong>Modifier un article publié</strong>
+          <span>Retrouvez les articles en ligne directement depuis GitHub, ouvrez-en un dans le constructeur, corrigez, republiez.</span>
+          <ul><li>Liste à jour des articles en ligne</li><li>Même adresse, même fichier remplacé</li><li>Mise à jour des llms incluse</li></ul>
+          <em>Voir les articles →</em>
+        </button>
       </div>
     </div>`;
   }
@@ -1616,6 +1704,30 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
       ? `<textarea data-brief="${key}" rows="${rows}" placeholder="${esc(placeholder)}">${esc(value)}</textarea>`
       : `<input type="text" data-brief="${key}" value="${esc(value)}" placeholder="${esc(placeholder)}" />`;
     return `<label class="field"><span class="field-label">${label}${required ? ' <b class="req">*</b>' : ""}</span>${control}${hint ? `<small class="hint">${hint}</small>` : ""}</label>`;
+  }
+
+  function renderBriefTable(t, i) {
+    const big = isBigTable(t);
+    return `<div class="brief-table ${big ? "big" : ""}">
+      <div class="row-between">
+        <span><code>${t.id}</code> ${t.fileName ? `<small class="muted">${esc(t.fileName)}</small>` : ""} ${t.rows ? `<small class="muted">· ${t.rows} lignes × ${t.cols} colonnes</small>` : ""} ${big ? '<span class="pill">Grand tableau : fichier à joindre</span>' : ""}</span>
+        <span class="row-actions">
+          ${t.markdown ? `<button class="link-btn" data-action="brief-table-download" data-index="${i}">Télécharger le CSV</button>` : ""}
+          <button class="link-btn danger" data-action="brief-table-remove" data-index="${i}">Retirer</button>
+        </span>
+      </div>
+      <div class="grid-2">
+        <input type="text" data-brief-table="${i}" data-key="title" value="${esc(t.title)}" placeholder="De quoi parle ce tableau ?" />
+        <input type="text" data-brief-table="${i}" data-key="placement" value="${esc(t.placement)}" list="placements" placeholder="Où le placer ?" />
+      </div>
+      ${
+        t.fileName
+          ? ""
+          : `<textarea rows="4" data-brief-table="${i}" data-key="paste" placeholder="Collez les cellules ici">${esc(t.paste || "")}</textarea>`
+      }
+      ${big ? `<p class="hint">Dans Claude ou ChatGPT, joignez le fichier <strong>${esc(t.fileName || `${t.id}.csv`)}</strong> (bouton « Télécharger le CSV » ci-dessus) en même temps que le prompt.</p>` : ""}
+      <div class="table-preview prose" data-table-preview="${i}">${t.markdown ? MD.toHtml(t.markdown) : '<p class="muted small">L\'aperçu du tableau apparaîtra ici.</p>'}</div>
+    </div>`;
   }
 
   const PLACEMENTS = ["Juste après le premier paragraphe", "Dans la section qui en parle le plus", "Avant la conclusion", "En illustration du tableau"];
@@ -1683,26 +1795,25 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
         </li>
         <li class="card">
           <h3><span class="badge">4</span> Tableaux <small class="muted">(facultatif)</small></h3>
-          <p class="muted small">Collez un tableau depuis Excel, Google Sheets ou Word (ou en CSV). L'IA l'insère tel quel à l'endroit indiqué.</p>
-          ${b.tables
-            .map(
-              (t, i) => `<div class="brief-table">
-                <div class="row-between"><code>${t.id}</code><button class="link-btn danger" data-action="brief-table-remove" data-index="${i}">Retirer</button></div>
-                <div class="grid-2">
-                  <input type="text" data-brief-table="${i}" data-key="title" value="${esc(t.title)}" placeholder="De quoi parle ce tableau ?" />
-                  <input type="text" data-brief-table="${i}" data-key="placement" value="${esc(t.placement)}" list="placements" placeholder="Où le placer ?" />
-                </div>
-                <textarea rows="4" data-brief-table="${i}" data-key="paste" placeholder="Collez les cellules ici">${esc(t.paste || "")}</textarea>
-                <div class="prose table-preview" data-table-preview="${i}">${t.markdown ? MD.toHtml(t.markdown) : '<p class="muted small">L\'aperçu du tableau apparaîtra ici.</p>'}</div>
-              </div>`
-            )
-            .join("")}
-          <button class="btn btn-ghost" data-action="brief-table-add">+ Ajouter un tableau</button>
+          <p class="muted small">Collez un tableau depuis Excel, Google Sheets ou Word, ou importez un fichier CSV. Les petits tableaux sont donnés à l'IA dans le prompt. Les grands tableaux (plus de ${BIG_TABLE_ROWS} lignes) ne le sont pas : vous joignez le fichier dans Claude ou ChatGPT, l'IA place un repère, et l'outil insère le tableau complet à l'import, sans risque d'erreur sur les chiffres.</p>
+          ${b.tables.map((t, i) => renderBriefTable(t, i)).join("")}
+          <div class="row-actions">
+            <button class="btn btn-ghost" data-action="brief-table-add">+ Coller un tableau</button>
+            <label class="btn btn-ghost"><input type="file" accept=".csv,.tsv,.txt,text/csv" multiple data-action="brief-csv" hidden />Importer un fichier CSV</label>
+          </div>
         </li>
         <li class="card prompt-card">
           <h3><span class="badge">5</span> Le prompt à copier</h3>
           ${b.subject.trim() ? "" : '<p class="check check-warn"><span class="dot"></span>Renseignez au moins le sujet (étape 1).</p>'}
           ${b.images.some((im) => !im.description.trim()) ? '<p class="check check-warn"><span class="dot"></span>Décrivez chaque image : l\'IA s\'en sert pour le texte alternatif et l\'emplacement.</p>' : ""}
+          ${
+            b.tables.filter((t) => t.markdown && isBigTable(t)).length
+              ? `<div class="note">À joindre avec le prompt : ${b.tables
+                  .filter((t) => t.markdown && isBigTable(t))
+                  .map((t, k) => `<button class="link-btn" data-action="brief-table-download" data-index="${b.tables.indexOf(t)}">${esc(t.fileName || `${t.id}.csv`)}</button>`)
+                  .join(", ")}</div>`
+              : ""
+          }
           <textarea class="prompt-box" id="prompt-box" readonly>${esc(buildPrompt())}</textarea>
           <div class="row-between">
             <small class="muted" id="prompt-size"></small>
@@ -1762,9 +1873,98 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
     if (size) size.textContent = `${box.value.length.toLocaleString("fr-FR")} caractères`;
   }
 
+  /* ---- edit a published article straight from GitHub ---- */
+
+  async function loadEditList() {
+    const s = site();
+    state.edit = { loading: true, error: null, posts: state.edit?.posts || null, siteId: s.id };
+    render({ keepScroll: true });
+    try {
+      const gh = ghClient();
+      const slugs = await gh.listPosts();
+      state.remoteSlugs[s.id] = slugs;
+      const posts = await Promise.all(
+        slugs.map(async (slug) => {
+          const file = await gh.getFile(`data/blogs/${slug}.md`);
+          try {
+            const { front, bodies } = MD.parsePostFile(file.text);
+            return {
+              slug,
+              text: file.text,
+              title: front.title || slug,
+              category: front.category || "",
+              publishedAt: front.publishedAt || "",
+              updatedAt: front.updatedAt || "",
+              readingTime: front.readingTime || "",
+              description: front.description || "",
+              en: Boolean(front.locales?.en || bodies.en),
+              words: MD.wordCount(bodies.fr || ""),
+              images: ((bodies.fr || "").match(/!\[/g) || []).length,
+            };
+          } catch (error) {
+            return { slug, text: file?.text || "", title: slug, broken: error.message };
+          }
+        })
+      );
+      posts.sort((a, b) => (b.publishedAt || "").localeCompare(a.publishedAt || ""));
+      state.edit = { loading: false, error: null, posts, siteId: s.id, loadedAt: new Date() };
+    } catch (error) {
+      state.edit = { loading: false, error: error.message, posts: null, siteId: s.id };
+    }
+    render({ keepScroll: true });
+  }
+
+  function renderEdit() {
+    const s = site();
+    const cfg = ghSettings();
+    const e = state.edit && state.edit.siteId === s.id ? state.edit : { posts: null };
+    const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" }) : "");
+    const list = e.posts
+      ? `<div class="row-between edit-tools">
+          <input type="search" class="search" data-edit-filter placeholder="Rechercher un article (titre, catégorie, slug)" />
+          <span class="muted small">${e.posts.length} article(s) · chargé à ${e.loadedAt ? e.loadedAt.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : ""}</span>
+        </div>
+        <div class="edit-list">${e.posts
+          .map(
+            (p) => `<article class="edit-row" data-edit-row="${esc(`${p.title} ${p.category} ${p.slug}`.toLowerCase())}">
+              <div class="edit-main">
+                <small class="muted">${esc(p.category)}${p.publishedAt ? ` · publié le ${fmt(p.publishedAt)}` : ""}${p.updatedAt && p.updatedAt !== p.publishedAt ? ` · mis à jour le ${fmt(p.updatedAt)}` : ""}</small>
+                <strong>${esc(p.title)}</strong>
+                ${p.broken ? `<p class="check check-error"><span class="dot"></span>Fichier illisible : ${esc(p.broken)}</p>` : `<p class="muted small">${esc(p.description)}</p>`}
+                <div class="tags"><code>/blog/${esc(p.slug)}/</code>${p.words ? `<span>${p.words} mots</span>` : ""}${p.readingTime ? `<span>${esc(p.readingTime)}</span>` : ""}<span>${p.en ? "FR + EN" : "FR seulement"}</span>${p.images ? `<span>${p.images} image(s)</span>` : ""}</div>
+              </div>
+              <div class="edit-actions">
+                <button class="btn btn-primary" data-action="edit-open" data-slug="${esc(p.slug)}" ${p.broken ? "disabled" : ""}>Modifier</button>
+                <a class="btn btn-ghost" href="${s.domain}/blog/${esc(p.slug)}/" target="_blank" rel="noopener">Voir en ligne ↗</a>
+                <a class="link-btn" href="https://github.com/${esc(cfg.repo)}/blob/${esc(cfg.branch)}/data/blogs/${esc(p.slug)}.md" target="_blank" rel="noopener">Fichier sur GitHub</a>
+              </div>
+            </article>`
+          )
+          .join("")}</div>
+        <p class="muted small mt">Après modification, l'article s'ouvre dans le constructeur (date « Mis à jour le » passée à aujourd'hui). Publiez depuis l'étape « Publier » : le même fichier est remplacé, l'adresse ne change pas.</p>`
+      : `<p class="muted">${e.loading ? "Chargement des articles depuis GitHub…" : cfg.token ? "Cliquez sur « Charger les articles »." : "Renseignez d'abord un jeton GitHub ci-contre, puis chargez les articles."}</p>`;
+    return `<div class="screen wide">
+      <button class="link-btn back" data-action="screen" data-screen="mode">← Retour au choix</button>
+      <header class="screen-head">
+        <p class="kicker">${esc(s.name)} · Articles publiés</p>
+        <h1>Modifier un article publié</h1>
+        <p>Les articles sont lus directement sur GitHub (<code>${esc(cfg.repo)}</code>, branche <code>${esc(cfg.branch)}</code>), c'est-à-dire la version réellement en ligne.</p>
+      </header>
+      <div class="edit-layout">
+        <section class="card">
+          <div class="row-between"><h3>Articles</h3><button class="btn btn-ghost" data-action="edit-load" ${cfg.token && !e.loading ? "" : "disabled"}>${e.posts ? "Actualiser" : "Charger les articles"}</button></div>
+          ${e.error ? `<p class="check check-error"><span class="dot"></span>${esc(e.error)}</p>` : ""}
+          ${list}
+        </section>
+        <aside class="card gh-inline">${renderGhPanel()}</aside>
+      </div>
+    </div>`;
+  }
+
   function renderScreen() {
     if (state.screen === "home") return renderHome();
     if (state.screen === "mode") return renderMode();
+    if (state.screen === "edit") return renderEdit();
     return renderAi();
   }
 
@@ -1808,6 +2008,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
       sessionStorage.setItem(STORE_SCREEN, state.screen);
     } catch {}
     if (full) {
+      $("#aside-gh").innerHTML = "";
       main.innerHTML = renderScreen();
       refreshPrompt();
       window.scrollTo(0, keepScroll ? scroll : 0);
@@ -2059,6 +2260,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
   function tableModal(ta) {
     let rows = 3, cols = 3;
     let grid = [["Colonne 1", "Colonne 2", "Colonne 3"], ["", "", ""], ["", "", ""]];
+    let bigRows = null;
     const drawGrid = (dlg) => {
       const host = $("#grid", dlg);
       host.style.gridTemplateColumns = `repeat(${cols}, minmax(110px, 1fr))`;
@@ -2080,6 +2282,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
           <label class="field"><span class="field-label">Colonnes</span><input type="number" name="cols" min="2" max="8" value="3" /></label>
         </div>
         <div class="table-grid" id="grid"></div>
+        <div class="row-actions mt"><label class="btn btn-ghost"><input type="file" accept=".csv,.tsv,.txt,text/csv" data-csv hidden />Importer un fichier CSV</label><span class="muted small" id="csv-info"></span></div>
         <details class="mt"><summary>Coller depuis Excel, Google Sheets ou Word</summary>
           <textarea name="paste" rows="5" placeholder="Copiez les cellules dans le tableur puis collez-les ici"></textarea>
           <button type="button" class="btn btn-ghost mt" data-paste>Remplir le tableau</button>
@@ -2094,18 +2297,34 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
         };
         $("input[name=rows]", dlg).addEventListener("change", resize);
         $("input[name=cols]", dlg).addEventListener("change", resize);
-        $("[data-paste]", dlg).addEventListener("click", () => {
-          const text = $("textarea[name=paste]", dlg).value.trim();
-          if (!text) return;
-          grid = text.split(/\r?\n/).map((line) => line.split(line.includes("\t") ? "\t" : /\s*[;|]\s*/));
-          rows = Math.min(30, grid.length);
-          cols = Math.min(8, Math.max(...grid.map((r) => r.length)));
+        const fill = (parsed, label) => {
+          if (!parsed.length) return toast("Aucune donnée lisible.", "error");
+          const width = Math.max(...parsed.map((r) => r.length));
+          if (parsed.length > 30 || width > 8) {
+            // Too big for the editable grid: inserted as is.
+            bigRows = parsed;
+            $("#grid", dlg).innerHTML = `<div class="table-preview prose">${MD.toHtml(rowsToMarkdown(parsed))}</div>`;
+            $("#grid", dlg).style.gridTemplateColumns = "1fr";
+            $("#csv-info", dlg).textContent = `${label} : ${parsed.length - 1} lignes × ${width} colonnes, inséré tel quel.`;
+            return;
+          }
+          bigRows = null;
+          grid = parsed;
+          rows = Math.max(2, parsed.length);
+          cols = Math.max(2, width);
           $("input[name=rows]", dlg).value = rows;
           $("input[name=cols]", dlg).value = cols;
+          $("#csv-info", dlg).textContent = label;
           drawGrid(dlg);
+        };
+        $("[data-paste]", dlg).addEventListener("click", () => fill(tableRows($("textarea[name=paste]", dlg).value), "Tableau collé"));
+        $("[data-csv]", dlg).addEventListener("change", async (e) => {
+          const file = e.target.files[0];
+          if (file) fill(parseCsv(await file.text()), file.name);
         });
       },
       onSubmit() {
+        if (bigRows) return insertBlock(ta, rowsToMarkdown(bigRows));
         const clean = (v) => String(v || "").replace(/\|/g, "/").replace(/\s+/g, " ").trim();
         const lines = [];
         for (let r = 0; r < rows; r++) {
@@ -2487,6 +2706,10 @@ A 2 or 3 sentence summary, leading to how you can help.
   function bindEvents() {
     document.addEventListener("input", (e) => {
       const t = e.target;
+      if (t.dataset.editFilter !== undefined) {
+        const q = norm(t.value.trim());
+        $$("[data-edit-row]").forEach((row) => (row.hidden = q && !norm(row.dataset.editRow).includes(q)));
+      }
       if (t.dataset.brief) {
         state.brief[t.dataset.brief] = t.value;
         saveBrief();
@@ -2502,7 +2725,15 @@ A 2 or 3 sentence summary, leading to how you can help.
         const tb = state.brief.tables[+t.dataset.briefTable];
         tb[t.dataset.key] = t.value;
         if (t.dataset.key === "paste") {
-          tb.markdown = toMarkdownTable(t.value);
+          const wasBig = isBigTable(tb);
+          updateTable(tb, t.value);
+          if (wasBig !== isBigTable(tb)) {
+            saveBrief();
+            render({ keepScroll: true });
+            const again = $(`[data-brief-table="${t.dataset.briefTable}"][data-key="paste"]`);
+            again?.focus();
+            return;
+          }
           const pv = $(`[data-table-preview="${t.dataset.briefTable}"]`);
           if (pv) pv.innerHTML = tb.markdown ? MD.toHtml(tb.markdown) : "";
         }
@@ -2553,6 +2784,22 @@ A 2 or 3 sentence summary, leading to how you can help.
           saveBrief();
           render({ keepScroll: true });
         })();
+        return;
+      }
+      if (t.dataset.action === "brief-csv") {
+        const files = Array.from(t.files || []);
+        t.value = "";
+        Promise.all(files.map((f) => f.text().then((text) => ({ name: f.name, text })))).then((list) => {
+          list.forEach(({ name, text }) => {
+            const n = Math.max(0, ...state.brief.tables.map((x) => +x.id.split("-")[1] || 0)) + 1;
+            const tb = { id: `tab-${n}`, title: name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " "), placement: "", fileName: name.replace(/\.[^.]+$/, "") + ".csv" };
+            updateTable(tb, text);
+            if (!tb.rows) toast(`${name} : aucune donnée lisible.`, "error");
+            else state.brief.tables.push(tb);
+          });
+          saveBrief();
+          render({ keepScroll: true });
+        });
         return;
       }
       if (t.dataset.action === "ai-file") {
@@ -2664,9 +2911,10 @@ A 2 or 3 sentence summary, leading to how you can help.
           go(state.step === "start" ? "article" : state.step);
         },
         mode: () => {
-          if (el.dataset.mode === "ai") {
-            state.screen = "ai";
+          if (el.dataset.mode === "ai" || el.dataset.mode === "edit") {
+            state.screen = el.dataset.mode;
             render();
+            if (el.dataset.mode === "edit" && ghSettings().token && !(state.edit && state.edit.siteId === site().id && state.edit.posts)) loadEditList();
             return;
           }
           go(hasContent(state.draft) ? "start" : "article");
@@ -2681,6 +2929,21 @@ A 2 or 3 sentence summary, leading to how you can help.
           state.brief.tables.push({ id: `tab-${n}`, title: "", placement: "", paste: "", markdown: "" });
           saveBrief();
           render({ keepScroll: true });
+        },
+        "edit-load": () => loadEditList(),
+        "edit-open": () => {
+          const post = state.edit?.posts?.find((x) => x.slug === el.dataset.slug);
+          if (!post) return;
+          if (hasContent(state.draft) && state.draft.slug !== post.slug) saveToDrafts();
+          try {
+            importPostText(post.text, site().id);
+          } catch (error) {
+            toast(`Import impossible : ${error.message}`, "error");
+          }
+        },
+        "brief-table-download": () => {
+          const tb = state.brief.tables[+el.dataset.index];
+          download(tb.fileName || `${tb.id}.csv`, "\uFEFF" + (tb.csv || rowsToCsv(tableRows(tb.paste))), "text/csv;charset=utf-8");
         },
         "brief-table-remove": () => {
           state.brief.tables.splice(+el.dataset.index, 1);
@@ -2921,7 +3184,7 @@ A 2 or 3 sentence summary, leading to how you can help.
     } catch {}
     try {
       const screen = sessionStorage.getItem(STORE_SCREEN);
-      if (["home", "mode", "ai", "wizard"].includes(screen)) state.screen = screen;
+      if (["home", "mode", "ai", "edit", "wizard"].includes(screen)) state.screen = screen;
     } catch {}
     applyTheme();
     loadBrief();

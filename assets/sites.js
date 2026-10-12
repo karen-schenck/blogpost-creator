@@ -41,6 +41,7 @@ window.SITES = {
       { slug: "agence-immobiliere-prospection-ne-suffit-plus", title: "Agence immobilière : pourquoi la visibilité et la prospection traditionnelles ne suffisent plus" },
       { slug: "audit-strategique-ecarts-invisibles", title: "Audit stratégique : révéler les écarts invisibles entre la stratégie et le terrain" },
       { slug: "facteur-humain-levier-de-performance", title: "Le facteur humain, un levier de performance mesurable" },
+      { slug: "integration-commerciaux-six-premiers-mois", title: "Intégration commerciaux : réussir les six premiers mois" },
       { slug: "ventes-qui-ralentissent-immobilier-neuf", title: "Programme neuf : quand les ventes ralentissent, que regarder avant de baisser les prix ?" },
     ],
     cta: {

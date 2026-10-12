@@ -471,3 +471,41 @@ label.btn { cursor: pointer; }
   .home-card-band { height: 80px; }
   .mode-card { padding: 22px; }
 }
+
+/* ---------- tables: scroll instead of overflow ---------- */
+.ai-steps > li, .brief-table, .brief-item-fields { min-width: 0; }
+.brief-table { overflow: hidden; }
+.brief-table textarea { max-height: 220px; }
+.table-preview { max-height: 340px; overflow: auto; border-radius: 10px; }
+.table-preview .md-table { overflow: visible; margin: 0; }
+.table-preview .md-table table { min-width: max-content; }
+.table-preview th { position: sticky; top: 0; z-index: 1; }
+.table-preview td, .table-preview th { white-space: nowrap; }
+.brief-table.big { border-color: var(--accent); }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 99px; background: var(--soft); color: var(--ink); font-size: 11.5px; font-weight: 700; }
+#grid .table-preview { max-height: 360px; }
+
+/* ---------- edit published articles ---------- */
+.mode-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.screen:has(.mode-grid) { max-width: 1180px; }
+.edit-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 24px; align-items: start; }
+.gh-inline { position: sticky; top: 84px; }
+.edit-tools { margin-bottom: 12px; }
+.search { flex: 1; min-width: 220px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.edit-list { display: grid; gap: 10px; }
+.edit-row { display: flex; gap: 16px; justify-content: space-between; align-items: flex-start; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: #fcfbf8; }
+.edit-main { min-width: 0; display: grid; gap: 4px; }
+.edit-main strong { font: 600 17px/1.3 var(--serif); color: var(--ink); }
+.edit-main p { margin: 0; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.tags span { padding: 2px 8px; border-radius: 99px; background: #efece4; font-size: 12px; color: var(--muted); }
+.edit-actions { display: grid; gap: 6px; justify-items: stretch; flex: none; width: 170px; text-align: center; }
+@media (max-width: 1100px) {
+  .mode-grid { grid-template-columns: minmax(0, 1fr); }
+  .edit-layout { grid-template-columns: minmax(0, 1fr); }
+  .gh-inline { position: static; order: -1; }
+}
+@media (max-width: 640px) {
+  .edit-row { flex-direction: column; }
+  .edit-actions { width: 100%; }
+}

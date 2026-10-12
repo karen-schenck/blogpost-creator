@@ -16,7 +16,10 @@ No build, no dependencies, no server: open `index.html` or the GitHub Pages URL.
    - blocking errors (invalid JSON with the error position, wrong types, missing required fields, unknown image ids, a file the site could not read back) stop the import and produce a ready-to-paste correction message for the AI;
    - safe fixes are applied and listed (slug normalised, reading time recomputed, unknown CTA pages and related posts replaced or removed, escaped line breaks decoded);
    - SEO length issues and formatting problems are reported as warnings.
+   - Tables: paste or import CSV files (quoted fields, `;`, `,` or tab). Tables over 15 rows are not copied into the prompt: it names the file (columns and a preview), you attach the downloaded CSV in the chatbot, the AI writes `[[TABLE:tab-1]]` and the tool inserts the full table on import.
 5. The imported article opens on **Vérification**, then **Publier** (one commit with the post, images and llms updates).
+
+**Modifier un article publié**: lists the articles straight from the site's GitHub repository (the version actually online), with search, and opens any of them in the builder; publishing replaces the same file.
 
 ## What it does
 
