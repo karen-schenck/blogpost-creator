@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Constructeur d'articles</title>
+  <meta name="description" content="Créer, vérifier et publier un article de blog pour karenschenck.fr et visionhumanconsulting.com, étape par étape." />
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231B2A4A'/%3E%3Cpath d='M9 22V10h7a4 4 0 0 1 0 8H9m7 0 5 4' stroke='%23C5A649' stroke-width='2.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <strong>Constructeur d'articles</strong>
+        <small id="site-name"></small>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="save-status" class="save-status"></span>
+      <button class="btn btn-ghost light" data-action="new-draft" title="Nouvel article">Nouveau</button>
+      <button class="btn btn-ghost light" data-action="download-draft" title="Télécharger le brouillon (.json)">Télécharger le brouillon</button>
+      <button class="btn btn-accent" data-action="save" title="Ctrl+S">Enregistrer</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" aria-label="Étapes">
+      <ol class="steps" id="steps"></ol>
+    </nav>
+    <main id="main" class="main"></main>
+    <aside class="aside">
+      <div class="aside-inner">
+        <h3 id="aside-title">Contrôles</h3>
+        <div id="aside-checks"></div>
+        <p class="aside-foot">Tout est enregistré dans ce navigateur au fil de l'eau. Pour changer d'ordinateur, téléchargez le brouillon (.json) puis rechargez-le à l'étape « Démarrer ».</p>
+      </div>
+    </aside>
+  </div>
+
+  <dialog id="modal"></dialog>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="assets/sites.js"></script>
+  <script src="assets/markdown.js"></script>
+  <script src="assets/github.js"></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>
