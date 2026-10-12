@@ -8,7 +8,7 @@ window.SITES = {
     tagline: "Conseil & formation · stratégie, organisation, facteur humain",
     brand: "Vision Human Consulting",
     domain: "https://visionhumanconsulting.com",
-    previewDomain: "https://karen-schenck.github.io/vision-consulting",
+    previewDomain: "https://visionhumanconsulting.com",
     repo: "karen-schenck/vision-consulting",
     branch: "main",
     localFolder: "vision-human-consulting",
