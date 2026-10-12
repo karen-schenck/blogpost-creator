@@ -509,3 +509,11 @@ label.btn { cursor: pointer; }
   .edit-row { flex-direction: column; }
   .edit-actions { width: 100%; }
 }
+
+/* ---------- live blog index chip ---------- */
+.blog-status { border: 1px solid rgba(255, 255, 255, 0.25); background: rgba(255, 255, 255, 0.06); color: rgba(255, 255, 255, 0.85); border-radius: 99px; padding: 5px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.blog-status:hover { border-color: #fff; }
+.blog-status[data-state="loading"] { opacity: 0.75; }
+.blog-status[data-state="error"] { border-color: #f0a39a; color: #ffd9d3; }
+.blog-status[data-state="cached"] { border-color: var(--soft); }
+@media (max-width: 1180px) { .blog-status { display: none; } }

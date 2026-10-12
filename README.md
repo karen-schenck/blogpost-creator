@@ -47,12 +47,21 @@ The token is kept in `sessionStorage` (forgotten when the tab closes) unless "Se
 | File | Role |
 |---|---|
 | `index.html` | Page shell |
-| `assets/sites.js` | Per-site profile: domain, repo, branch, categories, internal pages, existing posts, default CTA, llms format |
+| `assets/sites.js` | Per-site configuration: domain, repo, branch, internal pages, default CTA, llms format (no blog content) |
 | `assets/markdown.js` | Markdown renderer (mirror of the sites), lint, `.md` (de)serialisation, llms updaters |
 | `assets/github.js` | Minimal GitHub client (check, list, read, atomic commit, PR, Actions status) |
 | `assets/app.js` | Wizard, editor, checks, previews, persistence |
 | `assets/app.css` | Styles |
 
+## Live blog index (nothing hard-coded)
+
+The builder never stores the state of the blogs. At startup it reads each site's repository:
+
+- one GitHub API call lists `data/blogs/` (no token needed for a public repository; 60 calls per hour per visitor), then each post is downloaded from `raw.githubusercontent.com` (no quota);
+- with a token (panel « Connexion GitHub »), the authenticated API is used instead, which also works for private repositories.
+
+From the posts it derives everything it needs: slugs (related articles, slug collisions, internal links), titles in both languages, categories actually in use with their English labels, dates and word counts (edit page). The result is cached in the browser and refreshed in the background (chip 📚 in the top bar, click to refresh); if GitHub is unreachable, the last cached list is used and flagged « hors ligne ». Editing a published article always fetches the current file, never the cache.
+
 ## Keeping it in sync with the sites
 
-When a site gains a page, a category or a post, update its profile in `assets/sites.js` (the post list is also refreshed live from GitHub when a token is connected). If a site's `lib/markdown.ts` or blog frontmatter changes, mirror it in `assets/markdown.js`.
+`assets/sites.js` only holds site configuration: domain, repository and branch, internal pages, default call to action, llms.txt format and editorial notes. Update it when a site gains a page or moves repository. If a site's `lib/markdown.ts` or blog frontmatter changes, mirror it in `assets/markdown.js`.

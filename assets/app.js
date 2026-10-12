@@ -28,7 +28,7 @@
     editorMode: "split",
     previewLocale: "fr",
     publishTab: "auto",
-    remoteSlugs: {},
+    blog: {},
     live: [],
     savedAt: null,
     dirty: false,
@@ -122,13 +122,161 @@
     return Boolean(d && (d.fr.title || d.fr.body || d.fr.description));
   }
 
-  function knownPosts() {
-    const s = site();
-    const list = [...s.posts];
-    (state.remoteSlugs[s.id] || []).forEach((slug) => {
-      if (!list.some((p) => p.slug === slug)) list.push({ slug, title: slug });
+  /* ---------------- live blog index ----------------
+     Nothing about the published posts is hard-coded: the list (slugs, titles, categories, dates)
+     is read from the site's repository, cached in the browser and refreshed in the background.
+     Public repositories need no token (1 API call to list data/blogs, then raw file downloads);
+     with a token the authenticated API is used, which also works for private repositories. */
+
+  const BLOG_CACHE = (id) => `bpc.blog.${id}`;
+  const BLOG_TTL = 10 * 60 * 1000;
+
+  function blogState(siteId = site().id) {
+    if (!state.blog[siteId]) {
+      const cached = storeGet(BLOG_CACHE(siteId));
+      state.blog[siteId] = cached && Array.isArray(cached.posts) ? { status: "cached", posts: cached.posts, loadedAt: cached.loadedAt } : { status: "idle", posts: [] };
+    }
+    return state.blog[siteId];
+  }
+
+  function blogKnown(siteId = site().id) {
+    const b = blogState(siteId);
+    return b.status === "ok" || b.status === "cached" || (b.status === "loading" && b.loadedAt);
+  }
+
+  function blogPosts(siteId = site().id) {
+    return blogState(siteId).posts || [];
+  }
+
+  // Categories actually used on the blog, most used first, with their English label.
+  function blogCategories(siteId = site().id) {
+    const map = new Map();
+    blogPosts(siteId).forEach((p) => {
+      if (!p.category) return;
+      const cur = map.get(p.category) || { fr: p.category, en: p.categoryEn || "", n: 0 };
+      cur.n += 1;
+      if (!cur.en && p.categoryEn) cur.en = p.categoryEn;
+      map.set(p.category, cur);
     });
-    return list.filter((p) => p.slug !== state.draft.slug);
+    return [...map.values()].sort((a, b) => b.n - a.n);
+  }
+
+  function knownPosts() {
+    return blogPosts().filter((p) => p.slug !== state.draft.slug);
+  }
+
+  function summarisePost(slug, text) {
+    try {
+      const { front, bodies } = MD.parsePostFile(text);
+      const en = front.locales?.en || {};
+      return {
+        slug,
+        title: front.title || slug,
+        titleEn: en.title || "",
+        category: front.category || "",
+        categoryEn: en.category || "",
+        publishedAt: front.publishedAt || "",
+        updatedAt: front.updatedAt || "",
+        readingTime: front.readingTime || "",
+        description: front.description || "",
+        keywords: Array.isArray(front.keywords) ? front.keywords.slice(0, 6) : [],
+        en: Boolean(front.locales?.en || bodies.en),
+        words: MD.wordCount(bodies.fr || ""),
+        images: ((bodies.fr || "").match(/!\[/g) || []).length,
+      };
+    } catch (error) {
+      return { slug, title: slug, broken: error.message };
+    }
+  }
+
+  function rawUrl(cfg, path) {
+    return `https://raw.githubusercontent.com/${cfg.repo}/${encodeURIComponent(cfg.branch)}/${path}?t=${Date.now()}`;
+  }
+
+  async function fetchRepoFile(siteId, path) {
+    const cfg = ghSettings(siteId);
+    if (cfg.token) {
+      const file = await GH.create({ token: cfg.token.trim(), repo: cfg.repo.trim(), branch: cfg.branch.trim() }).getFile(path);
+      return file ? file.text : null;
+    }
+    const res = await fetch(rawUrl(cfg, path), { cache: "no-store" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`Lecture de ${path} impossible (${res.status}).`);
+    return res.text();
+  }
+
+  async function listRepoPosts(siteId) {
+    const cfg = ghSettings(siteId);
+    if (cfg.token) return GH.create({ token: cfg.token.trim(), repo: cfg.repo.trim(), branch: cfg.branch.trim() }).listPosts();
+    const res = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/data/blogs?ref=${encodeURIComponent(cfg.branch)}`, {
+      headers: { Accept: "application/vnd.github+json" },
+      cache: "no-store",
+    });
+    if (res.status === 404) throw new Error(`Dépôt ${cfg.repo} introuvable ou privé : ajoutez un jeton dans « Connexion GitHub ».`);
+    if (res.status === 403 || res.status === 429) throw new Error("Limite de lecture GitHub sans jeton atteinte (60 par heure) : ajoutez un jeton ou réessayez plus tard.");
+    if (!res.ok) throw new Error(`Lecture du dépôt impossible (${res.status}).`);
+    const items = await res.json();
+    return items.filter((it) => it.type === "file" && it.name.endsWith(".md")).map((it) => it.name.replace(/\.md$/, ""));
+  }
+
+  function loadBlogIndex(siteId = site().id, { force = false } = {}) {
+    const b = blogState(siteId);
+    if (b.status === "loading") return b.promise;
+    if (!force && b.status === "ok" && Date.now() - b.loadedAt < BLOG_TTL) return Promise.resolve(b);
+    b.status = "loading";
+    b.error = null;
+    onBlogUpdate(siteId);
+    b.promise = (async () => {
+      try {
+        const slugs = await listRepoPosts(siteId);
+        const posts = await Promise.all(slugs.map(async (slug) => summarisePost(slug, (await fetchRepoFile(siteId, `data/blogs/${slug}.md`)) || "")));
+        posts.sort((a, c) => (c.publishedAt || "").localeCompare(a.publishedAt || ""));
+        Object.assign(b, { status: "ok", posts, loadedAt: Date.now(), error: null });
+        storeSet(BLOG_CACHE(siteId), { posts, loadedAt: b.loadedAt });
+      } catch (error) {
+        b.status = b.loadedAt ? "cached" : "error";
+        b.error = error.message;
+      }
+      onBlogUpdate(siteId);
+      return b;
+    })();
+    return b.promise;
+  }
+
+  function blogStatusText(siteId = site().id) {
+    const b = blogState(siteId);
+    const n = b.posts.length;
+    const at = b.loadedAt ? new Date(b.loadedAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
+    if (b.status === "loading") return b.loadedAt ? `${n} articles · actualisation…` : "Lecture des articles…";
+    if (b.status === "ok") return `${n} article${n > 1 ? "s" : ""} publié${n > 1 ? "s" : ""} · à jour (${at})`;
+    if (b.status === "cached") return `${n} articles · données du ${new Date(b.loadedAt).toLocaleDateString("fr-FR")} ${at}${b.error ? " · hors ligne" : ""}`;
+    if (b.status === "error") return "Articles non chargés";
+    return "Articles non chargés";
+  }
+
+  // Refresh what depends on the index without disturbing what the user is typing.
+  function onBlogChip() {
+    const chip = $("#blog-status");
+    if (!chip || !state.draft) return;
+    const id = site().id;
+    const b = blogState(id);
+    chip.textContent = `📚 ${blogStatusText(id)}`;
+    chip.dataset.state = b.status;
+    chip.title = b.error ? `${b.error} · Cliquez pour réessayer` : "Liste des articles lue sur GitHub · Cliquez pour actualiser";
+  }
+
+  function onBlogUpdate(siteId) {
+    if (siteId === site().id) onBlogChip();
+    $$(`[data-blog-count="${siteId}"]`).forEach((el) => (el.textContent = blogStatusText(siteId)));
+    if (siteId !== site().id || !state.draft) return;
+    if (state.screen === "edit" || state.screen === "home" || state.screen === "mode") return render({ keepScroll: true });
+    if (state.screen === "ai") return refreshPrompt();
+    if (["links", "start", "review"].includes(state.step) && !document.activeElement?.matches("input, textarea, select")) return render({ keepScroll: true });
+    ["fr", "en"].forEach((loc) => {
+      const dl = $(`#cat-${loc}`);
+      if (dl) dl.innerHTML = blogCategories().map((c) => (c[loc] ? `<option value="${esc(c[loc])}"></option>` : "")).join("");
+    });
+    refreshLive();
   }
 
   function toast(message, kind = "info") {
@@ -336,7 +484,7 @@
     const out = [];
     check(out, "article", /^[a-z0-9]+(-[a-z0-9]+)*$/.test(d.slug), "error", "Slug (adresse) valide : minuscules, chiffres et tirets");
     if (d.slug) check(out, "article", d.slug.length <= 70, "warn", `Slug court, 70 caractères max (actuel : ${d.slug.length})`);
-    const taken = [...s.posts.map((p) => p.slug), ...(state.remoteSlugs[s.id] || [])].includes(d.slug);
+    const taken = blogPosts().some((p) => p.slug === d.slug);
     if (d.slug && taken) out.push({ step: "article", level: d.editingExisting ? "ok" : "warn", msg: d.editingExisting ? "Mise à jour d'un article existant (même slug)" : "Ce slug existe déjà : l'article existant serait remplacé" });
     const dateOk = /^\d{4}-\d{2}-\d{2}$/.test(d.publishedAt) && /^\d{4}-\d{2}-\d{2}$/.test(d.updatedAt);
     check(out, "article", dateOk && d.updatedAt >= d.publishedAt, "error", "Dates valides (mise à jour ≥ publication)");
@@ -480,8 +628,8 @@
   }
 
   function categoryOptions(loc) {
-    return `<datalist id="cat-${loc}">${site()
-      .categories.map((c) => `<option value="${esc(c[loc])}"></option>`)
+    return `<datalist id="cat-${loc}">${blogCategories()
+      .map((c) => (c[loc] ? `<option value="${esc(c[loc])}"></option>` : ""))
       .join("")}</datalist>`;
   }
 
@@ -508,7 +656,7 @@
         ${field({ label: "Titre de l'article (H1)", path: p("title"), required: true, min: 30, max: 100, placeholder: loc === "fr" ? "Audit stratégique : révéler les écarts invisibles entre la stratégie et le terrain" : "Strategic audit: revealing the invisible gaps", hint: "Le grand titre de la page. Clair, concret, avec le sujet principal au début." })}
         ${shared}
         <div class="grid-2">
-          ${field({ label: "Catégorie", path: p("category"), list: `cat-${loc}`, required: true, hint: "Choisissez dans la liste ou tapez une nouvelle catégorie.", placeholder: s.categories[0][loc] })}
+          ${field({ label: "Catégorie", path: p("category"), list: `cat-${loc}`, required: true, hint: "Les catégories déjà utilisées sur le blog sont proposées ; vous pouvez en créer une nouvelle.", placeholder: blogCategories()[0]?.[loc] || "" })}
           ${field({ label: "Surtitre (eyebrow)", path: p("heroEyebrow"), placeholder: loc === "fr" ? s.eyebrowExample : "", hint: "Petit texte au-dessus du titre, ex. « Catégorie · Sujet »." })}
         </div>
         ${categoryOptions(loc)}
@@ -751,7 +899,10 @@
     const s = site();
     const date = d.publishedAt ? new Date(d.publishedAt).toLocaleDateString(loc === "fr" ? "fr-FR" : "en-GB", { day: "numeric", month: "long", year: "numeric" }) : "";
     const heads = MD.headings(body).filter((h) => h.level === 2);
-    const related = d.relatedSlugs.map((slug) => s.posts.find((p) => p.slug === slug)?.title || slug);
+    const related = d.relatedSlugs.map((slug) => {
+      const post = blogPosts().find((p) => p.slug === slug);
+      return (loc === "en" && post?.titleEn) || post?.title || slug;
+    });
     return `<article class="article-preview">
       <div class="ap-hero">
         <p class="ap-eyebrow">${esc(L.heroEyebrow)}</p>
@@ -907,8 +1058,8 @@
       ${s.notes.length ? `<section class="card soft"><h3>Spécificités de ce site</h3><ul class="checks plain">${s.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></section>` : ""}`;
   }
 
-  function ghSettings() {
-    const s = site();
+  function ghSettings(siteId) {
+    const s = siteId ? SITES[siteId] : site();
     const key = `bpc.gh.${s.id}`;
     let saved = null;
     try {
@@ -1211,7 +1362,8 @@
     const b = state.brief;
     const langs = ["fr", "en"].filter((l) => b.languages[l]);
     const withEn = langs.includes("en");
-    const posts = [...s.posts, ...(state.remoteSlugs[s.id] || []).filter((x) => !s.posts.some((p) => p.slug === x)).map((x) => ({ slug: x, title: x }))];
+    const posts = blogPosts().filter((p) => !p.broken);
+    const cats = blogCategories();
     const day = today();
     const words = +b.length || 1400;
     const keywords = b.keywords.split(/[,\n]/).map((k) => k.trim()).filter(Boolean);
@@ -1330,7 +1482,7 @@ Pour la version anglaise, garde exactement les mêmes adresses (le site les adap
 
 ## Champs SEO (contraintes strictes)
 
-- "slug" : adresse de l'article en minuscules sans accents, mots séparés par des tirets, 3 à 7 mots, contient le mot-clé principal. Différent de : ${posts.map((p) => p.slug).join(", ")}.
+- "slug" : adresse de l'article en minuscules sans accents, mots séparés par des tirets, 3 à 7 mots, contient le mot-clé principal.${posts.length ? ` Différent de : ${posts.map((p) => p.slug).join(", ")}.` : ""}
 - "title" : titre H1, 30 à 100 caractères.
 - "seoTitle" : 35 à 65 caractères, commence par le mot-clé principal, sans le nom du site.
 - "description" : meta description de 120 à 160 caractères, avec le mot-clé principal et une promesse concrète.
@@ -1340,9 +1492,9 @@ Pour la version anglaise, garde exactement les mêmes adresses (le site les adap
 - "intro" : chapô de 150 à 500 caractères (texte simple, sans Markdown).
 - "keyTakeaways" : 3 à 5 phrases courtes et affirmatives.
 - "faq" : 3 à 6 questions que les lecteurs se posent vraiment, réponses de 40 à 400 caractères (texte simple).
-- "category" : de préférence une de celles-ci (français / anglais) : ${s.categories.map((c) => `${c.fr} / ${c.en}`).join(" ; ")}.
+- "category" : ${cats.length ? `de préférence une de celles déjà utilisées sur le blog (français / anglais) : ${cats.map((c) => `${c.fr} / ${c.en || "?"}`).join(" ; ")}. Sinon, une nouvelle catégorie courte et cohérente avec celles-ci.` : "une catégorie courte (1 à 3 mots) qui décrit le thème."}
 - "readingTime" : nombre de mots du body divisé par 200, arrondi, suivi de « min ».
-- "relatedSlugs" : 1 ou 2 slugs pris UNIQUEMENT dans cette liste : ${posts.map((p) => p.slug).join(", ")}.
+- "relatedSlugs" : ${posts.length ? `1 ou 2 slugs pris UNIQUEMENT dans cette liste : ${posts.map((p) => p.slug).join(", ")}.` : "[] (aucun autre article publié pour l'instant)."}
 - "cta" : un appel à l'action adapté au sujet. "primaryHref" et "secondaryHref" doivent être des adresses de la liste du maillage interne, sans le / final (ex. "/contact"). Exemple du ton attendu : « ${s.cta.fr.title} ».
 - "publishedAt" et "updatedAt" : "${day}".
 
@@ -1398,7 +1550,8 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
     else if (obj.site && obj.site !== site().id) warnings.push(`Ce brouillon est pour le site « ${SITES[obj.site].name} » : l'outil bascule sur ce site.`);
     const s = SITES[siteId];
     const d = newDraft(siteId);
-    const known = [...s.posts.map((p) => p.slug), ...(state.remoteSlugs[siteId] || [])];
+    const indexKnown = blogKnown(siteId);
+    const known = blogPosts(siteId).map((p) => p.slug);
 
     const str = (path, value, { required = false, min = 0, max = Infinity, label = path, plain = false } = {}) => {
       if (value == null || value === "") {
@@ -1523,8 +1676,13 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
 
     // Related
     const related = strList(obj.relatedSlugs, "relatedSlugs", { min: 0, max: 3 });
-    d.relatedSlugs = related.filter((r) => known.includes(r) && r !== slug);
-    related.filter((r) => !d.relatedSlugs.includes(r)).forEach((r) => warnings.push(`Article lié « ${r} » inconnu : retiré.`));
+    if (indexKnown) {
+      d.relatedSlugs = related.filter((r) => known.includes(r) && r !== slug);
+      related.filter((r) => !d.relatedSlugs.includes(r)).forEach((r) => warnings.push(`Article lié « ${r} » inconnu : retiré.`));
+    } else {
+      d.relatedSlugs = related.filter((r) => /^[a-z0-9]+(-[a-z0-9]+)*$/.test(r) && r !== slug);
+      if (related.length) warnings.push("Liste des articles du blog indisponible : les articles liés n'ont pas pu être vérifiés.");
+    }
 
     // English
     const wantsEn = obj.enEnabled === true || (obj.enEnabled == null && obj.en != null);
@@ -1643,7 +1801,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
             <small>${esc(s.domain.replace("https://", ""))}</small>
             <strong>${esc(s.name)}</strong>
             <span>${esc(s.tagline)}</span>
-            <em>${s.posts.length} articles publiés · dépôt ${esc(s.repo)}</em>
+            <em><span data-blog-count="${s.id}">${esc(blogStatusText(s.id))}</span> · dépôt ${esc(s.repo)}</em>
           </span>
           <span class="home-card-cta">Choisir ce site →</span>
         </button>`
@@ -1875,54 +2033,16 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
 
   /* ---- edit a published article straight from GitHub ---- */
 
-  async function loadEditList() {
-    const s = site();
-    state.edit = { loading: true, error: null, posts: state.edit?.posts || null, siteId: s.id };
-    render({ keepScroll: true });
-    try {
-      const gh = ghClient();
-      const slugs = await gh.listPosts();
-      state.remoteSlugs[s.id] = slugs;
-      const posts = await Promise.all(
-        slugs.map(async (slug) => {
-          const file = await gh.getFile(`data/blogs/${slug}.md`);
-          try {
-            const { front, bodies } = MD.parsePostFile(file.text);
-            return {
-              slug,
-              text: file.text,
-              title: front.title || slug,
-              category: front.category || "",
-              publishedAt: front.publishedAt || "",
-              updatedAt: front.updatedAt || "",
-              readingTime: front.readingTime || "",
-              description: front.description || "",
-              en: Boolean(front.locales?.en || bodies.en),
-              words: MD.wordCount(bodies.fr || ""),
-              images: ((bodies.fr || "").match(/!\[/g) || []).length,
-            };
-          } catch (error) {
-            return { slug, text: file?.text || "", title: slug, broken: error.message };
-          }
-        })
-      );
-      posts.sort((a, b) => (b.publishedAt || "").localeCompare(a.publishedAt || ""));
-      state.edit = { loading: false, error: null, posts, siteId: s.id, loadedAt: new Date() };
-    } catch (error) {
-      state.edit = { loading: false, error: error.message, posts: null, siteId: s.id };
-    }
-    render({ keepScroll: true });
-  }
-
   function renderEdit() {
     const s = site();
     const cfg = ghSettings();
-    const e = state.edit && state.edit.siteId === s.id ? state.edit : { posts: null };
+    const b = blogState(s.id);
+    const e = { posts: b.posts.length || b.status === "ok" ? b.posts : null, loading: b.status === "loading", error: b.error, loadedAt: b.loadedAt ? new Date(b.loadedAt) : null };
     const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" }) : "");
     const list = e.posts
       ? `<div class="row-between edit-tools">
           <input type="search" class="search" data-edit-filter placeholder="Rechercher un article (titre, catégorie, slug)" />
-          <span class="muted small">${e.posts.length} article(s) · chargé à ${e.loadedAt ? e.loadedAt.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : ""}</span>
+          <span class="muted small">${esc(blogStatusText(s.id))}</span>
         </div>
         <div class="edit-list">${e.posts
           .map(
@@ -1942,17 +2062,17 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
           )
           .join("")}</div>
         <p class="muted small mt">Après modification, l'article s'ouvre dans le constructeur (date « Mis à jour le » passée à aujourd'hui). Publiez depuis l'étape « Publier » : le même fichier est remplacé, l'adresse ne change pas.</p>`
-      : `<p class="muted">${e.loading ? "Chargement des articles depuis GitHub…" : cfg.token ? "Cliquez sur « Charger les articles »." : "Renseignez d'abord un jeton GitHub ci-contre, puis chargez les articles."}</p>`;
+      : `<p class="muted">${e.loading ? "Lecture des articles sur GitHub…" : "Cliquez sur « Charger les articles »."}</p>`;
     return `<div class="screen wide">
       <button class="link-btn back" data-action="screen" data-screen="mode">← Retour au choix</button>
       <header class="screen-head">
         <p class="kicker">${esc(s.name)} · Articles publiés</p>
         <h1>Modifier un article publié</h1>
-        <p>Les articles sont lus directement sur GitHub (<code>${esc(cfg.repo)}</code>, branche <code>${esc(cfg.branch)}</code>), c'est-à-dire la version réellement en ligne.</p>
+        <p>Les articles sont lus directement sur GitHub (<code>${esc(cfg.repo)}</code>, branche <code>${esc(cfg.branch)}</code>), c'est-à-dire la version réellement en ligne. ${cfg.token ? "" : "Sans jeton, la lecture fonctionne pour un dépôt public ; un jeton reste nécessaire pour publier."}</p>
       </header>
       <div class="edit-layout">
         <section class="card">
-          <div class="row-between"><h3>Articles</h3><button class="btn btn-ghost" data-action="edit-load" ${cfg.token && !e.loading ? "" : "disabled"}>${e.posts ? "Actualiser" : "Charger les articles"}</button></div>
+          <div class="row-between"><h3>Articles</h3><button class="btn btn-ghost" data-action="edit-load" ${e.loading ? "disabled" : ""}>${e.loading ? "Lecture…" : e.posts ? "Actualiser" : "Charger les articles"}</button></div>
           ${e.error ? `<p class="check check-error"><span class="dot"></span>${esc(e.error)}</p>` : ""}
           ${list}
         </section>
@@ -1991,6 +2111,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
     root.style.setProperty("--soft", s.theme.soft);
     root.style.setProperty("--paper", s.theme.paper);
     $("#site-name").textContent = s.name;
+    onBlogChip();
   }
 
   function renderSidebar() {
@@ -2047,6 +2168,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
     }
     applyTheme();
     loadBrief();
+    loadBlogIndex(id);
   }
 
   /* ---------------- editor helpers ---------------- */
@@ -2126,7 +2248,7 @@ Réponds UNIQUEMENT avec un bloc de code \`\`\`json contenant un JSON valide, sa
   function linkModal(ta, loc) {
     const s = site();
     const selected = ta.value.slice(ta.selectionStart, ta.selectionEnd);
-    const posts = [...s.posts, ...(state.remoteSlugs[s.id] || []).filter((x) => !s.posts.some((p) => p.slug === x)).map((x) => ({ slug: x, title: x }))].filter((p) => p.slug !== state.draft.slug);
+    const posts = knownPosts();
     openModal({
       title: "Insérer un lien",
       body: `<label class="field"><span class="field-label">Texte du lien</span><input name="text" value="${esc(selected)}" required placeholder="ex. notre audit stratégique" /></label>
@@ -2531,8 +2653,8 @@ A 2 or 3 sentence summary, leading to how you can help.
     try {
       const gh = ghClient();
       const info = await gh.check();
-      const slugs = await gh.listPosts();
-      state.remoteSlugs[site().id] = slugs;
+      await loadBlogIndex(site().id, { force: true });
+      const slugs = blogPosts().map((p) => p.slug);
       const push = info.canPush === false ? " · ⚠️ ce jeton ne peut pas écrire" : "";
       state.gh.checked = `Connecté à ${info.fullName} (${info.private ? "privé" : "public"}), branche ${gh.branch}, ${slugs.length} articles trouvés${push}.`;
       box.innerHTML = `<p class="check check-${info.canPush === false ? "warn" : "ok"}"><span class="dot"></span>${esc(state.gh.checked)}</p>`;
@@ -2548,9 +2670,9 @@ A 2 or 3 sentence summary, leading to how you can help.
     const host = $("#gh-post-list");
     host.innerHTML = '<p class="muted">Chargement…</p>';
     try {
-      const gh = ghClient();
-      const slugs = await gh.listPosts();
-      state.remoteSlugs[site().id] = slugs;
+      await loadBlogIndex(site().id, { force: true });
+      if (blogState().error) throw new Error(blogState().error);
+      const slugs = blogPosts().map((p) => p.slug);
       host.innerHTML = slugs.length
         ? `<ul class="file-list">${slugs.map((s) => `<li><code>${esc(s)}.md</code><button class="link-btn" data-action="gh-import" data-slug="${esc(s)}">Modifier</button></li>`).join("")}</ul>`
         : '<p class="muted">Aucun article trouvé dans data/blogs.</p>';
@@ -2562,9 +2684,9 @@ A 2 or 3 sentence summary, leading to how you can help.
   async function ghImport(slug) {
     try {
       if (hasContent(state.draft) && !confirm("Remplacer le brouillon en cours par cet article ? (Pensez à « Enregistrer » avant.)")) return;
-      const file = await ghClient().getFile(`data/blogs/${slug}.md`);
-      if (!file) throw new Error("Fichier introuvable.");
-      importPostText(file.text);
+      const text = await fetchRepoFile(site().id, `data/blogs/${slug}.md`);
+      if (!text) throw new Error("Fichier introuvable.");
+      importPostText(text);
     } catch (error) {
       toast(error.message, "error");
     }
@@ -2622,7 +2744,7 @@ A 2 or 3 sentence summary, leading to how you can help.
       });
       log("ok", `Commit créé : <a href="${res.url}" target="_blank" rel="noopener">${res.sha.slice(0, 7)}</a>`);
       d.editingExisting = true;
-      state.remoteSlugs[s.id] = Array.from(new Set([...(state.remoteSlugs[s.id] || []), d.slug]));
+      if (!res.prUrl) loadBlogIndex(s.id, { force: true });
       autosave();
 
       if (res.prUrl) {
@@ -2822,6 +2944,7 @@ A 2 or 3 sentence summary, leading to how you can help.
         scheduleSave();
         render({ keepScroll: true });
       }
+      if (t.dataset.gh === "token" || t.dataset.gh === "repo" || t.dataset.gh === "branch") loadBlogIndex(site().id, { force: true });
       if (t.dataset.gh && (t.type === "radio" || t.type === "checkbox")) {
         const cfg = ghSettings();
         cfg[t.dataset.gh] = t.type === "checkbox" ? t.checked : t.value;
@@ -2914,7 +3037,7 @@ A 2 or 3 sentence summary, leading to how you can help.
           if (el.dataset.mode === "ai" || el.dataset.mode === "edit") {
             state.screen = el.dataset.mode;
             render();
-            if (el.dataset.mode === "edit" && ghSettings().token && !(state.edit && state.edit.siteId === site().id && state.edit.posts)) loadEditList();
+            if (el.dataset.mode === "edit") loadBlogIndex(site().id, { force: true });
             return;
           }
           go(hasContent(state.draft) ? "start" : "article");
@@ -2930,17 +3053,24 @@ A 2 or 3 sentence summary, leading to how you can help.
           saveBrief();
           render({ keepScroll: true });
         },
-        "edit-load": () => loadEditList(),
-        "edit-open": () => {
-          const post = state.edit?.posts?.find((x) => x.slug === el.dataset.slug);
-          if (!post) return;
-          if (hasContent(state.draft) && state.draft.slug !== post.slug) saveToDrafts();
+        "edit-load": () => loadBlogIndex(site().id, { force: true }),
+        "edit-open": async () => {
+          const slug = el.dataset.slug;
+          el.disabled = true;
+          el.textContent = "Ouverture…";
           try {
-            importPostText(post.text, site().id);
+            // Always the current version from the repository, never a cached copy.
+            const text = await fetchRepoFile(site().id, `data/blogs/${slug}.md`);
+            if (!text) throw new Error("Fichier introuvable sur GitHub.");
+            if (hasContent(state.draft) && state.draft.slug !== slug) saveToDrafts();
+            importPostText(text, site().id);
           } catch (error) {
             toast(`Import impossible : ${error.message}`, "error");
+            el.disabled = false;
+            el.textContent = "Modifier";
           }
         },
+        "blog-refresh": () => loadBlogIndex(site().id, { force: true }),
         "brief-table-download": () => {
           const tb = state.brief.tables[+el.dataset.index];
           download(tb.fileName || `${tb.id}.csv`, "\uFEFF" + (tb.csv || rowsToCsv(tableRows(tb.paste))), "text/csv;charset=utf-8");
@@ -3102,7 +3232,7 @@ A 2 or 3 sentence summary, leading to how you can help.
           const keepCta = d.en.cta;
           d.en = JSON.parse(JSON.stringify(d.fr));
           d.en.cta = { ...keepCta };
-          d.en.category = site().categories.find((c) => c.fr === d.fr.category)?.en || d.fr.category;
+          d.en.category = blogCategories().find((c) => c.fr === d.fr.category)?.en || d.fr.category;
           scheduleSave();
           render({ keepScroll: true });
         },
@@ -3191,6 +3321,8 @@ A 2 or 3 sentence summary, leading to how you can help.
     bindEvents();
     render();
     renderSaveStatus();
+    loadBlogIndex(state.draft.site);
+    Object.keys(SITES).filter((id) => id !== state.draft.site).forEach((id) => loadBlogIndex(id));
   }
 
   document.addEventListener("DOMContentLoaded", boot);

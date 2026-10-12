@@ -1,4 +1,6 @@
-/* Site profiles: everything the builder needs to know about each blog. */
+/* Site configuration only (domain, repository, pages, defaults).
+   The state of each blog (published posts, categories) is never stored here:
+   it is read live from the repository by the builder (see "live blog index" in app.js). */
 window.SITES = {
   vhc: {
     id: "vhc",
@@ -13,14 +15,6 @@ window.SITES = {
     theme: { ink: "#1B2A4A", accent: "#A8872F", soft: "#E8D9A8", paper: "#FAF8F3" },
     eyebrowExample: "Conseil · Audit stratégique",
     eyebrowSeparator: " · ",
-    categories: [
-      { fr: "Conseil", en: "Consulting" },
-      { fr: "Facteur humain", en: "Human factor" },
-      { fr: "Immobilier neuf", en: "New-build real estate" },
-      { fr: "Agences immobilières", en: "Real estate agencies" },
-      { fr: "Formation", en: "Training" },
-      { fr: "Enseignement supérieur", en: "Higher education" },
-    ],
     pages: [
       { path: "/", label: "Accueil" },
       { path: "/conseil", label: "Conseil" },
@@ -36,13 +30,6 @@ window.SITES = {
       { path: "/a-propos", label: "À propos" },
       { path: "/blog", label: "Blog" },
       { path: "/contact", label: "Contact" },
-    ],
-    posts: [
-      { slug: "agence-immobiliere-prospection-ne-suffit-plus", title: "Agence immobilière : pourquoi la visibilité et la prospection traditionnelles ne suffisent plus" },
-      { slug: "audit-strategique-ecarts-invisibles", title: "Audit stratégique : révéler les écarts invisibles entre la stratégie et le terrain" },
-      { slug: "facteur-humain-levier-de-performance", title: "Le facteur humain, un levier de performance mesurable" },
-      { slug: "integration-commerciaux-six-premiers-mois", title: "Intégration commerciaux : réussir les six premiers mois" },
-      { slug: "ventes-qui-ralentissent-immobilier-neuf", title: "Programme neuf : quand les ventes ralentissent, que regarder avant de baisser les prix ?" },
     ],
     cta: {
       fr: {
@@ -86,13 +73,6 @@ window.SITES = {
     theme: { ink: "#3F536B", accent: "#8A2E3B", soft: "#E9DCCB", paper: "#F7F3EC" },
     eyebrowExample: "Pourquoi consulter · Anxiété",
     eyebrowSeparator: " · ",
-    categories: [
-      { fr: "Anxiété", en: "Anxiety" },
-      { fr: "Burn-out professionnel", en: "Professional Burnout" },
-      { fr: "Difficultés relationnelles", en: "Relationship Difficulties" },
-      { fr: "Transitions de vie", en: "Life Transitions" },
-      { fr: "Intelligence artificielle", en: "Artificial intelligence" },
-    ],
     pages: [
       { path: "/", label: "Accueil" },
       { path: "/pourquoi-consulter", label: "Pourquoi consulter" },
@@ -108,12 +88,6 @@ window.SITES = {
       { path: "/informations-pratiques", label: "Informations pratiques" },
       { path: "/blog", label: "Blog" },
       { path: "/contact", label: "Contact & rendez-vous" },
-    ],
-    posts: [
-      { slug: "comprendre-anxiete", title: "Comprendre l’anxiété : quand les inquiétudes prennent trop de place" },
-      { slug: "intelligence-artificielle-therapie", title: "Une intelligence artificielle peut-elle remplacer une thérapie ?" },
-      { slug: "les-premiers-signes-du-burn-out", title: "Les premiers signes du burn-out professionnel" },
-      { slug: "schemas-relationnels-repetitifs", title: "Pourquoi revit-on parfois les mêmes schémas relationnels ?" },
     ],
     cta: {
       fr: {
