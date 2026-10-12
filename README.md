@@ -2,7 +2,7 @@
 
 Static page that builds a publish-ready blog post, step by step, for:
 
-- **karenschenck.fr** (`website/`, repo `kaddour-youcef/keren_website`, branch `master`)
+- **karenschenck.fr** (`website/`, repo `karen-schenck/psy-website`, branch `master`)
 - **visionhumanconsulting.com** (`vision-human-consulting/`, repo `karen-schenck/vision-consulting`, branch `main`)
 
 No build, no dependencies, no server: open `index.html` or the GitHub Pages URL.

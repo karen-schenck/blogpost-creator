@@ -67,7 +67,7 @@ window.SITES = {
     brand: "Karen Schenck",
     domain: "https://karenschenck.fr",
     previewDomain: "https://karenschenck.fr",
-    repo: "kaddour-youcef/keren_website",
+    repo: "karen-schenck/psy-website",
     branch: "master",
     localFolder: "website",
     theme: { ink: "#3F536B", accent: "#8A2E3B", soft: "#E9DCCB", paper: "#F7F3EC" },
